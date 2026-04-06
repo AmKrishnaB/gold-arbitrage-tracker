@@ -1,0 +1,37 @@
+{
+  "name": "gold-arbitrage-tracker",
+  "version": "1.0.0",
+  "description": "Track gold coin/bar prices across Myntra & Ajio, detect deals below IBJA spot price, notify via Telegram",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "dry-run": "tsx src/dry-run.ts"
+  },
+  "keywords": ["gold", "arbitrage", "deal-tracker", "telegram-bot"],
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "better-sqlite3": "^11.0.0",
+    "drizzle-orm": "^0.35.0",
+    "grammy": "^1.30.0",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@types/node-cron": "^3.0.0",
+    "drizzle-kit": "^0.28.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
