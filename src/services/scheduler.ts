@@ -8,7 +8,8 @@ import { detectDeals } from './dealDetector.js';
 import { processDeals } from './notifier.js';
 import { updateActiveDeals } from '../bot/index.js';
 import { getDB } from '../db/index.js';
-import { scanLog, ibjaRateHistory } from '../db/schema.js';
+import { products, scanLog, ibjaRateHistory } from '../db/schema.js';
+import { sql } from 'drizzle-orm';
 import { logger } from '../utils/logger.js';
 import type { NormalizedProduct, PlatformOffers } from '../config/types.js';
 
@@ -53,7 +54,10 @@ export async function runScanCycle(): Promise<void> {
 
     const allProducts = [...ajioProducts, ...myntraProducts];
 
-    // 3. Fetch Ajio offers (cached for 1 hour)
+    // 3. Upsert all products into DB (required before deal detection — FK constraint)
+    await upsertProducts(allProducts);
+
+    // 4. Fetch Ajio offers (cached for 1 hour)
     if (!cachedOffers || Date.now() - cachedOffers.fetchedAt > 60 * 60 * 1000) {
       cachedOffers = await fetchAjioOffers().catch((err) => {
         logger.error({ error: err.message }, 'Ajio offers fetch failed');
@@ -97,6 +101,67 @@ export async function runScanCycle(): Promise<void> {
   } finally {
     scanRunning = false;
   }
+}
+
+/**
+ * Upsert scanned products into the DB.
+ * Must run before deal detection so FK constraints on active_deals are satisfied.
+ */
+async function upsertProducts(allProducts: NormalizedProduct[]): Promise<void> {
+  const db = getDB();
+  const now = Date.now();
+
+  for (const p of allProducts) {
+    const platformId = p.id.split(':')[1] ?? p.id;
+    try {
+      await db.insert(products).values({
+        id: p.id,
+        platform: p.platform,
+        platformId,
+        name: p.name,
+        brand: p.brand,
+        url: p.url,
+        weightGrams: p.totalWeightGrams,
+        fineness: p.fineness,
+        karat: p.karat,
+        isCombo: p.isCombo,
+        pieceCount: p.pieceCount,
+        mrp: p.mrp,
+        sellingPrice: p.sellingPrice,
+        offerPrice: p.couponPrice ?? null,
+        couponPrice: p.couponPrice ?? null,
+        effectivePrice: p.effectivePrice,
+        discountPercent: p.discountPercent,
+        weightSource: p.weightSource,
+        puritySource: p.puritySource,
+        parseWarnings: p.parseWarnings.length > 0 ? JSON.stringify(p.parseWarnings) : null,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        isActive: true,
+        rating: p.rating ?? null,
+        ratingCount: p.ratingCount ?? null,
+      }).onConflictDoUpdate({
+        target: products.id,
+        set: {
+          mrp: sql`excluded.mrp`,
+          sellingPrice: sql`excluded.selling_price`,
+          offerPrice: sql`excluded.offer_price`,
+          couponPrice: sql`excluded.coupon_price`,
+          effectivePrice: sql`excluded.effective_price`,
+          discountPercent: sql`excluded.discount_percent`,
+          lastSeenAt: sql`excluded.last_seen_at`,
+          isActive: sql`1`,
+          name: sql`excluded.name`,
+          rating: sql`excluded.rating`,
+          ratingCount: sql`excluded.rating_count`,
+        },
+      });
+    } catch (err) {
+      logger.debug({ productId: p.id, error: (err as Error).message }, 'Product upsert failed');
+    }
+  }
+
+  logger.debug({ count: allProducts.length }, 'Products upserted');
 }
 
 /**
