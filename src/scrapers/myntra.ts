@@ -62,6 +62,38 @@ function createClient(
   });
 }
 
+// ─── Cloudflare Worker Proxy ───
+
+/**
+ * Send a request to Myntra via Cloudflare Worker proxy.
+ * The Worker forwards requests from CF edge IPs (not datacenter-flagged).
+ */
+async function fetchViaCfWorker(
+  targetUrl: string,
+  body: object,
+): Promise<MyntraListingResponse> {
+  const workerUrl = config.cfWorkerUrl;
+
+  const res = await axios.post<MyntraListingResponse>(
+    workerUrl,
+    {
+      url: targetUrl,
+      method: 'POST',
+      headers: MYNTRA_HEADERS,
+      body,
+    },
+    {
+      timeout: 20_000,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(config.cfWorkerSecret ? { 'X-Auth-Secret': config.cfWorkerSecret } : {}),
+      },
+    },
+  );
+
+  return res.data;
+}
+
 // ─── Response Types ───
 
 interface MyntraListingResponse {
@@ -114,9 +146,13 @@ function buildRequestBody(paginationContext?: Record<string, unknown>): object {
 }
 
 /**
- * Fetch a single page of Myntra listings with proxy rotation.
- * Tries: manual MYNTRA_PROXY first (if set), then rotates through Proxifly pool.
- * On 403/timeout, marks proxy as failed and tries the next one.
+ * Fetch a single page of Myntra listings.
+ *
+ * Strategy priority:
+ *   1. Cloudflare Worker proxy (CF_WORKER_URL) — best for VPS, CF edge IPs bypass blocking
+ *   2. Manual proxy (MYNTRA_PROXY) — user-provided residential proxy
+ *   3. Proxifly free proxy pool — rotate through Indian datacenter proxies
+ *   4. Direct connection — works locally / on residential IPs
  */
 async function fetchListingPage(
   paginationContext?: Record<string, unknown>,
@@ -129,7 +165,13 @@ async function fetchListingPage(
     paginationContext ? (paginationContext as any)?.paginationContext : undefined,
   );
 
-  // Strategy 1: If user set MYNTRA_PROXY manually, use it directly
+  // Strategy 1: Cloudflare Worker proxy (recommended for VPS)
+  if (config.cfWorkerUrl) {
+    const res = await fetchViaCfWorker(url, body);
+    return res;
+  }
+
+  // Strategy 2: Manual proxy (MYNTRA_PROXY env var)
   const manualAgent = createManualProxyAgent();
   if (manualAgent) {
     const client = createClient(manualAgent);
@@ -137,7 +179,7 @@ async function fetchListingPage(
     return res.data;
   }
 
-  // Strategy 2: Rotate through Proxifly proxy pool
+  // Strategy 3: Rotate through Proxifly proxy pool
   if (needsRefresh()) {
     await refreshProxyPool();
   }
@@ -147,11 +189,8 @@ async function fetchListingPage(
   for (let attempt = 0; attempt < MAX_PROXY_ATTEMPTS; attempt++) {
     const proxyInfo = getNextProxy();
     if (!proxyInfo) {
-      // No proxies left — try direct connection as last resort
-      logger.warn('Myntra: no proxies available, trying direct connection');
-      const client = createClient();
-      const res = await client.post<MyntraListingResponse>(url, body);
-      return res.data;
+      // No proxies left — fall through to direct connection
+      break;
     }
 
     try {
@@ -159,7 +198,6 @@ async function fetchListingPage(
       const client = createClient(proxyInfo.agent);
       const res = await client.post<MyntraListingResponse>(url, body);
 
-      // Success — mark proxy as good
       markProxySuccess(proxyInfo.index);
       return res.data;
     } catch (err) {
@@ -174,14 +212,17 @@ async function fetchListingPage(
 
       markProxyFailed(proxyInfo.index);
 
-      // If not a proxy-related failure, don't bother trying more proxies
       if (!isBlockOrTimeout && status && status < 500) {
         throw lastError;
       }
     }
   }
 
-  throw lastError ?? new Error('Myntra: all proxy attempts exhausted');
+  // Strategy 4: Direct connection (works on residential IPs / locally)
+  logger.warn('Myntra: all proxies exhausted, trying direct connection');
+  const client = createClient();
+  const res = await client.post<MyntraListingResponse>(url, body);
+  return res.data;
 }
 
 /**
@@ -204,10 +245,14 @@ export async function fetchAllMyntraProducts(): Promise<NormalizedProduct[]> {
   let nextPageParams: Record<string, unknown> | undefined;
   let pageNum = 0;
 
-  // Ensure proxy pool is fresh before starting
-  if (!config.myntraProxy && needsRefresh()) {
+  // Ensure proxy pool is fresh before starting (skip if using CF Worker or manual proxy)
+  if (!config.cfWorkerUrl && !config.myntraProxy && needsRefresh()) {
     const poolSize = await refreshProxyPool();
     logger.info({ poolSize }, 'Myntra: proxy pool ready');
+  }
+
+  if (config.cfWorkerUrl) {
+    logger.info('Myntra: using Cloudflare Worker proxy');
   }
 
   do {

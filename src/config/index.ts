@@ -24,6 +24,10 @@ export const config = {
   // Proxy for Myntra (needed on datacenter/cloud IPs)
   myntraProxy: process.env.MYNTRA_PROXY || '',
 
+  // Cloudflare Worker proxy for Myntra (bypasses datacenter IP blocking)
+  cfWorkerUrl: process.env.CF_WORKER_URL || '',
+  cfWorkerSecret: process.env.CF_WORKER_SECRET || '',
+
   // Notification thresholds
   silentEditThresholdPct: 2,   // Min savings % change to silent-edit a message
   renotifyThresholdPct: 5,     // Min savings % change to send new message
