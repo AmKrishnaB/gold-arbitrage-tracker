@@ -55,8 +55,16 @@ export default {
         );
       }
 
+      // Sanitize URL — pagination URIs from Myntra contain unencoded {, }, "
+      // which are invalid in URLs and cause fetch() to reject them
+      const sanitizedUrl = targetUrl
+        .replace(/{/g, '%7B')
+        .replace(/}/g, '%7D')
+        .replace(/"/g, '%22')
+        .replace(/\|/g, '%7C');
+
       // Forward request to Myntra from CF edge
-      const myntraResponse = await fetch(targetUrl, {
+      const myntraResponse = await fetch(sanitizedUrl, {
         method: payload.method || 'POST',
         headers: {
           ...targetHeaders,
