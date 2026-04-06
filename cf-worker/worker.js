@@ -60,8 +60,6 @@ export default {
         method: payload.method || 'POST',
         headers: {
           ...targetHeaders,
-          // Override host-related headers
-          'Host': new URL(targetUrl).host,
         },
         body: targetBody ? JSON.stringify(targetBody) : undefined,
       });
@@ -74,6 +72,7 @@ export default {
         headers: {
           'Content-Type': myntraResponse.headers.get('Content-Type') || 'application/json',
           'X-Proxy-Status': myntraResponse.status.toString(),
+          'X-Proxy-Target': targetUrl,
           'Access-Control-Allow-Origin': '*',
         },
       });

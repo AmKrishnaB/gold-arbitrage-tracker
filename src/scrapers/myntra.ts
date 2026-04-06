@@ -74,24 +74,36 @@ async function fetchViaCfWorker(
 ): Promise<MyntraListingResponse> {
   const workerUrl = config.cfWorkerUrl;
 
-  const res = await axios.post<MyntraListingResponse>(
-    workerUrl,
-    {
-      url: targetUrl,
-      method: 'POST',
-      headers: MYNTRA_HEADERS,
-      body,
-    },
-    {
-      timeout: 20_000,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(config.cfWorkerSecret ? { 'X-Auth-Secret': config.cfWorkerSecret } : {}),
+  try {
+    const res = await axios.post<MyntraListingResponse>(
+      workerUrl,
+      {
+        url: targetUrl,
+        method: 'POST',
+        headers: MYNTRA_HEADERS,
+        body,
       },
-    },
-  );
+      {
+        timeout: 20_000,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(config.cfWorkerSecret ? { 'X-Auth-Secret': config.cfWorkerSecret } : {}),
+        },
+      },
+    );
 
-  return res.data;
+    return res.data;
+  } catch (err) {
+    // Log response body on error for debugging
+    const responseData = (err as any)?.response?.data;
+    if (responseData) {
+      logger.debug(
+        { status: (err as any)?.response?.status, responseData: JSON.stringify(responseData).slice(0, 500) },
+        'Myntra: CF Worker error response',
+      );
+    }
+    throw err;
+  }
 }
 
 // ─── Response Types ───
@@ -167,6 +179,7 @@ async function fetchListingPage(
 
   // Strategy 1: Cloudflare Worker proxy (recommended for VPS)
   if (config.cfWorkerUrl) {
+    logger.debug({ targetUrl: url, hasBody: !!body, hasPagination: !!paginationContext }, 'Myntra: CF Worker request');
     const res = await fetchViaCfWorker(url, body);
     return res;
   }
