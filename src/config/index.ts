@@ -21,6 +21,9 @@ export const config = {
   // IBJA API
   ibjaApiUrl: 'https://ibja-api.vercel.app/latest',
 
+  // Proxy for Myntra (needed on datacenter/cloud IPs)
+  myntraProxy: process.env.MYNTRA_PROXY || '',
+
   // Notification thresholds
   silentEditThresholdPct: 2,   // Min savings % change to silent-edit a message
   renotifyThresholdPct: 5,     // Min savings % change to send new message

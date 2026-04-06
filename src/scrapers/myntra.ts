@@ -1,8 +1,19 @@
 import axios, { type AxiosInstance } from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import type { RawMyntraProduct, NormalizedProduct } from '../config/types.js';
+import { config } from '../config/index.js';
 import { parseGoldData, shouldTrackProduct, validateParsedProduct } from '../parsers/goldParser.js';
 import { logger } from '../utils/logger.js';
 import { retry } from '../utils/retry.js';
+import {
+  refreshProxyPool,
+  needsRefresh,
+  getNextProxy,
+  markProxyFailed,
+  markProxySuccess,
+  getPoolStats,
+} from '../services/proxyPool.js';
 
 // ─── Myntra API Config ───
 
@@ -26,12 +37,28 @@ const MYNTRA_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
 };
 
+// ─── Max proxy attempts per page request ───
+const MAX_PROXY_ATTEMPTS = 5;
+
 // ─── Client ───
 
-function createClient(): AxiosInstance {
+function createManualProxyAgent(): HttpsProxyAgent<string> | SocksProxyAgent | undefined {
+  const proxy = config.myntraProxy;
+  if (!proxy) return undefined;
+
+  if (proxy.startsWith('socks')) {
+    return new SocksProxyAgent(proxy);
+  }
+  return new HttpsProxyAgent(proxy);
+}
+
+function createClient(
+  agent?: HttpsProxyAgent<string> | SocksProxyAgent,
+): AxiosInstance {
   return axios.create({
     timeout: 15_000,
     headers: MYNTRA_HEADERS,
+    ...(agent ? { httpsAgent: agent, httpAgent: agent } : {}),
   });
 }
 
@@ -87,15 +114,13 @@ function buildRequestBody(paginationContext?: Record<string, unknown>): object {
 }
 
 /**
- * Fetch a single page of Myntra listings.
- * First page: no pagination context.
- * Subsequent pages: must provide paginationContext from previous response.
+ * Fetch a single page of Myntra listings with proxy rotation.
+ * Tries: manual MYNTRA_PROXY first (if set), then rotates through Proxifly pool.
+ * On 403/timeout, marks proxy as failed and tries the next one.
  */
 async function fetchListingPage(
   paginationContext?: Record<string, unknown>,
 ): Promise<MyntraListingResponse> {
-  const client = createClient();
-
   const url = paginationContext
     ? `https://api.myntra.com${(paginationContext as any)?.uri || LISTING_URL}`
     : `${LISTING_URL}?${new URLSearchParams(LISTING_PARAMS as Record<string, string>)}`;
@@ -104,8 +129,59 @@ async function fetchListingPage(
     paginationContext ? (paginationContext as any)?.paginationContext : undefined,
   );
 
-  const res = await client.post<MyntraListingResponse>(url, body);
-  return res.data;
+  // Strategy 1: If user set MYNTRA_PROXY manually, use it directly
+  const manualAgent = createManualProxyAgent();
+  if (manualAgent) {
+    const client = createClient(manualAgent);
+    const res = await client.post<MyntraListingResponse>(url, body);
+    return res.data;
+  }
+
+  // Strategy 2: Rotate through Proxifly proxy pool
+  if (needsRefresh()) {
+    await refreshProxyPool();
+  }
+
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < MAX_PROXY_ATTEMPTS; attempt++) {
+    const proxyInfo = getNextProxy();
+    if (!proxyInfo) {
+      // No proxies left — try direct connection as last resort
+      logger.warn('Myntra: no proxies available, trying direct connection');
+      const client = createClient();
+      const res = await client.post<MyntraListingResponse>(url, body);
+      return res.data;
+    }
+
+    try {
+      logger.debug({ proxy: proxyInfo.proxyUrl, attempt }, 'Myntra: trying proxy');
+      const client = createClient(proxyInfo.agent);
+      const res = await client.post<MyntraListingResponse>(url, body);
+
+      // Success — mark proxy as good
+      markProxySuccess(proxyInfo.index);
+      return res.data;
+    } catch (err) {
+      lastError = err as Error;
+      const status = (err as any)?.response?.status;
+      const isBlockOrTimeout = status === 403 || status === 429 || (err as any)?.code === 'ECONNABORTED';
+
+      logger.debug(
+        { proxy: proxyInfo.proxyUrl, status, error: lastError.message },
+        'Myntra: proxy failed',
+      );
+
+      markProxyFailed(proxyInfo.index);
+
+      // If not a proxy-related failure, don't bother trying more proxies
+      if (!isBlockOrTimeout && status && status < 500) {
+        throw lastError;
+      }
+    }
+  }
+
+  throw lastError ?? new Error('Myntra: all proxy attempts exhausted');
 }
 
 /**
@@ -120,12 +196,19 @@ function extractProductTiles(response: MyntraListingResponse): RawMyntraProduct[
 /**
  * Fetch ALL Myntra gold coin listings using cursor-based pagination.
  * Must be sequential — each page depends on previous response's cursor.
+ * Uses Proxifly proxy pool with auto-rotation on 403/timeout.
  */
 export async function fetchAllMyntraProducts(): Promise<NormalizedProduct[]> {
   const startTime = Date.now();
   const allRaw: RawMyntraProduct[] = [];
   let nextPageParams: Record<string, unknown> | undefined;
   let pageNum = 0;
+
+  // Ensure proxy pool is fresh before starting
+  if (!config.myntraProxy && needsRefresh()) {
+    const poolSize = await refreshProxyPool();
+    logger.info({ poolSize }, 'Myntra: proxy pool ready');
+  }
 
   do {
     try {
@@ -174,8 +257,12 @@ export async function fetchAllMyntraProducts(): Promise<NormalizedProduct[]> {
   }
 
   const duration = Date.now() - startTime;
+  const poolStats = getPoolStats();
   logger.info(
-    { total: allRaw.length, normalized: normalized.length, failed, pages: pageNum, durationMs: duration },
+    {
+      total: allRaw.length, normalized: normalized.length, failed, pages: pageNum,
+      durationMs: duration, proxyPool: poolStats,
+    },
     'Myntra: fetch complete',
   );
 
@@ -208,7 +295,7 @@ function normalizeMyntraProduct(raw: RawMyntraProduct): NormalizedProduct | null
 
   // Coupon price (parse from couponData.text if available)
   let couponPrice: number | undefined;
-  if (raw.couponData && raw.couponData !== false) {
+  if (raw.couponData && typeof raw.couponData === 'object') {
     couponPrice = parseCouponPrice(raw.couponData.text);
   }
 

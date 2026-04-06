@@ -53,7 +53,7 @@ function parseIBJARates(raw: IBJARates): GoldRates {
   const suffix = session === 'PM' ? '_PM' : '_AM';
 
   const getRate = (field: string): number => {
-    const val = parseInt((raw as Record<string, string>)[field + suffix]) || 0;
+    const val = parseInt((raw as unknown as Record<string, string>)[field + suffix]) || 0;
     // IBJA rates are per 10 grams
     return val / 10;
   };
@@ -79,12 +79,14 @@ function parseIBJARates(raw: IBJARates): GoldRates {
 export function getIBJARateForFineness(fineness: Fineness): number {
   if (!cachedRates) return 0;
 
-  const field = FINENESS_TO_FIELD[fineness];
-  if (!field) return 0;
+  // Map fineness to perGram key
+  const keyMap: Record<number, keyof GoldRates['perGram']> = {
+    999.9: 999, 999: 999, 995: 995, 916: 916, 750: 750, 585: 585,
+  };
+  const key = keyMap[fineness];
+  if (!key) return 0;
 
-  // Map to the correct key in perGram
-  const key = field.replace('lblGold', '') as unknown as keyof GoldRates['perGram'];
-  return cachedRates.perGram[key as unknown as number] || 0;
+  return cachedRates.perGram[key] || 0;
 }
 
 /**
