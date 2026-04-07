@@ -227,6 +227,7 @@ async function handleExpiredDeal(
     savingsPct: 0,
     promoSavings: 0,
     bankOfferSavings: 0,
+    topBankOffers: [],
     finalPrice: existing.currentPrice,
     totalSavings: 0,
     totalSavingsPct: 0,

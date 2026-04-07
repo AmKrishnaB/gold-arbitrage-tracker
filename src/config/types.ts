@@ -169,6 +169,14 @@ export interface AjioBankOffer {
   eligiblePaymentInstruments: string[];
   endDate: number;
   tncUrl?: string;
+  offerCode?: string;
+
+  // Enriched at fetch time (description parsing + T&C check)
+  parsedType: 'flat' | 'percent' | 'cashback_cap' | 'unknown';
+  parsedPct: number | null;        // e.g. 5, 10, 12 (null for flat/cashback)
+  parsedCap: number | null;        // max discount in ₹ (from desc or T&C)
+  excludesGold: boolean;           // from T&C page
+  needsReview: boolean;            // couldn't determine gold exclusion
 }
 
 export interface PlatformOffers {
@@ -191,6 +199,7 @@ export interface Deal {
   promoSavings: number;
   bestBankOffer?: AjioBankOffer;
   bankOfferSavings: number;
+  topBankOffers: BankOfferResult[];   // Top 3 applicable offers with calculated savings
 
   // Final price after all offers
   finalPrice: number;
@@ -200,6 +209,11 @@ export interface Deal {
   ibjaRate: number;            // Per-gram IBJA rate used
   ibjaSession: 'AM' | 'PM';
   detectedAt: number;
+}
+
+export interface BankOfferResult {
+  offer: AjioBankOffer;
+  savings: number;
 }
 
 // ─── Notification Types ───

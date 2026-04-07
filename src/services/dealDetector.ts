@@ -1,6 +1,7 @@
 import type {
   NormalizedProduct,
   Deal,
+  BankOfferResult,
   PlatformOffers,
   AjioBankOffer,
   GoldRates,
@@ -52,6 +53,7 @@ function evaluateProduct(
   let promoSavings = 0;
   let bankOfferSavings = 0;
   let bestBankOffer: AjioBankOffer | undefined;
+  let topBankOffers: BankOfferResult[] = [];
 
   // Apply Ajio promo codes and bank offers
   if (product.platform === 'ajio' && offers?.platform === 'ajio') {
@@ -59,11 +61,14 @@ function evaluateProduct(
     promoSavings = calculatePromoSavings(finalPrice, offers.promos);
 
     // Bank offer savings (calculated on original price, not after promo)
-    const bankResult = calculateBestBankOffer(product.effectivePrice, offers.bankOffers);
-    bankOfferSavings = bankResult.savings;
-    bestBankOffer = bankResult.offer;
+    const bankResult = calculateTopBankOffers(product.effectivePrice, offers.bankOffers);
+    topBankOffers = bankResult;
+    if (bankResult.length > 0) {
+      bestBankOffer = bankResult[0].offer;
+      bankOfferSavings = bankResult[0].savings;
+    }
 
-    // Final price after all offers
+    // Final price after all offers (use best bank offer only)
     finalPrice = product.effectivePrice - promoSavings - bankOfferSavings;
   }
 
@@ -87,6 +92,7 @@ function evaluateProduct(
     promoSavings,
     bestBankOffer,
     bankOfferSavings,
+    topBankOffers,
     finalPrice,
     totalSavings,
     totalSavingsPct,
@@ -149,57 +155,76 @@ function calculatePromoSavings(
 }
 
 /**
- * Calculate the best applicable bank offer for a given price.
- * Returns savings amount and the offer details.
+ * Calculate all applicable bank offers for a given price, sorted by savings.
+ * Returns top offers (up to 3) with their calculated savings.
  *
- * Bank offers from Ajio have:
- * - `offerAmount`: either a percentage (e.g. 12 = 12%) or a flat/cashback cap
- * - `absolute`: true = flat amount, false = percentage
- * - BUT some "cashback" offers have absolute=false with offerAmount as the max cashback cap
- *   (e.g., "Assured cashback up to ₹500" has offerAmount=500, absolute=false)
- *
- * We detect this by: if offerAmount > 50 and absolute=false, it's likely a cashback cap, not a percentage.
- * Real percentage offers are always <= 15% (typical bank discount).
+ * Uses enriched offer data:
+ * - Skips gold-excluded offers (from T&C analysis)
+ * - Skips offers needing admin review (conservative)
+ * - Uses parsedType/parsedPct/parsedCap from description parsing
  */
-function calculateBestBankOffer(
+function calculateTopBankOffers(
   price: number,
   bankOffers: AjioBankOffer[],
-): { savings: number; offer?: AjioBankOffer } {
-  let bestSavings = 0;
-  let bestOffer: AjioBankOffer | undefined;
+): BankOfferResult[] {
+  const results: BankOfferResult[] = [];
 
   for (const offer of bankOffers) {
+    // Skip gold-excluded offers
+    if (offer.excludesGold) continue;
+
+    // Skip offers pending admin review (conservative)
+    if (offer.needsReview) continue;
+
+    // Skip if price below threshold
     if (price < offer.thresholdAmount) continue;
 
     let savings: number;
 
-    if (offer.absolute) {
-      // Flat amount discount
-      savings = offer.offerAmount;
-    } else if (offer.offerAmount > 50) {
-      // offerAmount > 50 and not absolute → this is a cashback CAP, not a percentage
-      // e.g., "Assured cashback up to ₹500" → offerAmount=500
-      // Treat as flat cashback capped at offerAmount
-      savings = offer.offerAmount;
-    } else {
-      // Genuine percentage discount (e.g., 5%, 10%, 12%)
-      // Parse max cap from description
-      const maxMatch = offer.description.match(/(?:up\s*to|upto)\s*Rs\.?\s*([\d,]+)/i);
-      const maxCap = maxMatch ? parseInt(maxMatch[1].replace(/,/g, '')) : Infinity;
-      savings = Math.min(price * offer.offerAmount / 100, maxCap);
+    switch (offer.parsedType) {
+      case 'flat':
+        savings = offer.parsedCap ?? offer.offerAmount;
+        break;
+
+      case 'cashback_cap':
+        savings = offer.parsedCap ?? offer.offerAmount;
+        break;
+
+      case 'percent': {
+        const pct = offer.parsedPct ?? offer.offerAmount;
+        const cap = offer.parsedCap ?? 1500; // Safe default if no cap found
+        savings = Math.min(price * pct / 100, cap);
+        break;
+      }
+
+      default:
+        // Unknown type — treat offerAmount as flat cap (conservative)
+        savings = Math.min(offer.offerAmount, 500);
+        break;
     }
 
     // Sanity: savings should never exceed 25% of price
-    const maxReasonableSavings = price * 0.25;
-    savings = Math.min(savings, maxReasonableSavings);
+    savings = Math.min(savings, price * 0.25);
 
-    if (savings > bestSavings) {
-      bestSavings = savings;
-      bestOffer = offer;
+    if (savings > 0) {
+      results.push({ offer, savings: Math.round(savings) });
     }
   }
 
-  return { savings: Math.round(bestSavings), offer: bestOffer };
+  // Sort by savings descending
+  results.sort((a, b) => b.savings - a.savings);
+
+  // Deduplicate by bankName (keep highest savings per bank)
+  const seenBanks = new Set<string>();
+  const deduped: BankOfferResult[] = [];
+  for (const r of results) {
+    if (!seenBanks.has(r.offer.bankName)) {
+      seenBanks.add(r.offer.bankName);
+      deduped.push(r);
+    }
+  }
+
+  return deduped.slice(0, 3);
 }
 
 /**

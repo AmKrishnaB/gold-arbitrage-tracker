@@ -40,13 +40,19 @@ export function formatDealMessage(
     lines.push(`🎫 Coupon Price: ${fmtRs(product.couponPrice)} (apply coupon on ${platformLabel})`);
   }
 
-  // Ajio promo + bank offer
+  // Ajio promo
   if (deal.promoSavings > 0) {
-    const promo = deal.product.platform === 'ajio' ? '(apply at checkout)' : '';
-    lines.push(`🎫 Promo Savings: -${fmtRs(deal.promoSavings)} ${promo}`);
+    lines.push(`🎫 Promo Savings: -${fmtRs(deal.promoSavings)} (apply at checkout)`);
   }
 
-  if (deal.bankOfferSavings > 0 && deal.bestBankOffer) {
+  // Top 3 bank/wallet offers
+  if (deal.topBankOffers.length > 0) {
+    for (const bo of deal.topBankOffers) {
+      const instruments = formatInstruments(bo.offer.eligiblePaymentInstruments);
+      lines.push(`🏦 ${bo.offer.bankName}: -${fmtRs(bo.savings)}${instruments ? ` (${instruments})` : ''}`);
+    }
+  } else if (deal.bankOfferSavings > 0 && deal.bestBankOffer) {
+    // Fallback for legacy
     lines.push(`🏦 ${deal.bestBankOffer.bankName}: -${fmtRs(deal.bankOfferSavings)}`);
   }
 
@@ -59,7 +65,7 @@ export function formatDealMessage(
   lines.push(`📊 Market Value: ${fmtRs(marketValue)}`);
   lines.push(`✅ You Save: ${fmtRs(totalSavings)} (${totalSavingsPct.toFixed(1)}%)${totalSavingsPct >= 5 ? ' 🔥' : ''}`);
   lines.push('');
-  lines.push(`🔗 Buy Now: ${affiliateUrl}`);
+  lines.push(affiliateUrl);
   lines.push(`⏰ ${formatTime(deal.detectedAt)}`);
 
   return lines.join('\n');
@@ -119,6 +125,7 @@ export function formatGoldRateMessage(
 
 /**
  * Format a deals summary (for /deals command).
+ * Shows top 10 deals with links.
  */
 export function formatDealsSummary(deals: Deal[]): string {
   if (deals.length === 0) {
@@ -126,18 +133,21 @@ export function formatDealsSummary(deals: Deal[]): string {
   }
 
   const lines = [
-    `📋 Active Gold Deals (${deals.length})`,
+    `📋 Top Gold Deals (${Math.min(deals.length, 10)} of ${deals.length})`,
     '',
   ];
 
   for (const deal of deals.slice(0, 10)) {
     const platform = deal.product.platform === 'ajio' ? 'Ajio' : 'Myntra';
+    const purityLabel = deal.product.karat === 24 ? '24K' : `${deal.product.karat}K`;
+    const fire = deal.totalSavingsPct >= 5 ? '🔥' : '✅';
     lines.push(
-      `${deal.totalSavingsPct >= 5 ? '🔥' : '✅'} ${deal.product.brand} ${deal.product.totalWeightGrams}g ${deal.product.karat}K — ${platform}`,
+      `${fire} ${deal.product.brand} ${deal.product.totalWeightGrams}g ${purityLabel} — ${platform}`,
     );
     lines.push(
       `   ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
     );
+    lines.push(`   ${deal.product.url}`);
     lines.push('');
   }
 
@@ -163,6 +173,25 @@ function getStatusLine(status: DealStatus | 'price_drop' | 'better_offer' | 'dea
 }
 
 // ─── Formatting Helpers ───
+
+/**
+ * Format payment instruments into a short readable label.
+ */
+function formatInstruments(instruments: string[]): string {
+  if (!instruments || instruments.length === 0) return '';
+  const labels = instruments.map((i) => {
+    switch (i) {
+      case 'UPI': return 'UPI';
+      case 'WALLET': return 'Wallet';
+      case 'CARD':
+      case 'SAVED_CARD': return 'Card';
+      case 'NET_BANKING': return 'NetBanking';
+      default: return i;
+    }
+  });
+  // Deduplicate
+  return [...new Set(labels)].join('/');
+}
 
 function fmtRs(amount: number): string {
   return `₹${Math.round(amount).toLocaleString('en-IN')}`;

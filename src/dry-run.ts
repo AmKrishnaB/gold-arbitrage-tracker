@@ -21,7 +21,19 @@ async function dryRun() {
 
   // ─── Step 1: Fetch IBJA Rates ───
   console.log('📊 Step 1: Fetching IBJA gold rates...');
-  const rates = await fetchIBJARates();
+  let rates: import('./config/types.js').GoldRates;
+  try {
+    rates = await fetchIBJARates();
+  } catch (err) {
+    // IBJA rates not available (before market hours) — use last known rates for testing
+    console.log('⚠️ IBJA API unavailable, using fallback rates for testing');
+    rates = {
+      date: new Date().toISOString().slice(0, 10),
+      session: 'PM',
+      perGram: { 999: 14890, 995: 14830, 916: 13639, 750: 11167, 585: 8710 },
+      fetchedAt: Date.now(),
+    };
+  }
   console.log(formatGoldRateMessage(rates.date, rates.session, rates.perGram));
   console.log();
 
@@ -79,6 +91,38 @@ async function dryRun() {
     console.log(`    ${p.code}: ${p.description.slice(0, 80)}`);
   }
   console.log(`  Bank offers: ${offers.bankOffers.length}`);
+
+  // Show enriched bank offer breakdown
+  const goldOk = offers.bankOffers.filter((o) => !o.excludesGold && !o.needsReview);
+  const goldExcluded = offers.bankOffers.filter((o) => o.excludesGold);
+  const needsReview = offers.bankOffers.filter((o) => o.needsReview);
+
+  console.log(`    Gold-applicable: ${goldOk.length}`);
+  console.log(`    Gold-excluded:   ${goldExcluded.length}`);
+  console.log(`    Needs review:    ${needsReview.length}`);
+
+  if (goldExcluded.length > 0) {
+    console.log('  🚫 Gold-excluded offers:');
+    for (const o of goldExcluded) {
+      console.log(`    - ${o.bankName} (${o.parsedType}, cap=${o.parsedCap})`);
+    }
+  }
+
+  if (needsReview.length > 0) {
+    console.log('  ⚠️ Needs review:');
+    for (const o of needsReview) {
+      console.log(`    - ${o.bankName}: ${o.description.slice(0, 60)} | tncUrl=${o.tncUrl ?? 'none'}`);
+    }
+  }
+
+  if (goldOk.length > 0) {
+    console.log('  ✅ Gold-applicable offers:');
+    for (const o of goldOk) {
+      const capStr = o.parsedCap !== null ? `cap=₹${o.parsedCap}` : 'no cap';
+      const pctStr = o.parsedPct !== null ? `${o.parsedPct}%` : '';
+      console.log(`    - ${o.bankName}: ${o.parsedType} ${pctStr} ${capStr} | ${o.eligiblePaymentInstruments.join(',')}`);
+    }
+  }
   console.log();
 
   // ─── Step 5: Detect Deals ───
@@ -89,8 +133,8 @@ async function dryRun() {
   if (deals.length === 0) {
     console.log('📋 No deals found (all products are above IBJA market value)\n');
   } else {
-    console.log(`🔥 ${deals.length} DEAL(S) FOUND!\n`);
-    for (const deal of deals) {
+    console.log(`🔥 ${deals.length} DEAL(S) FOUND! (showing top 50)\n`);
+    for (const deal of deals.slice(0, 50)) {
       console.log('─'.repeat(60));
       console.log(formatDealMessage(deal, deal.product.url));
       console.log();
@@ -200,22 +244,29 @@ function calculateQuickPromo(price: number, offers: { promos: Array<{ descriptio
   return 0;
 }
 
-function calculateQuickBank(price: number, offers: { bankOffers: Array<{ offerAmount: number; thresholdAmount: number; absolute: boolean; description: string }> }): number {
+function calculateQuickBank(price: number, offers: { bankOffers: Array<{ offerAmount: number; thresholdAmount: number; absolute: boolean; description: string; parsedType: string; parsedPct: number | null; parsedCap: number | null; excludesGold: boolean; needsReview: boolean }> }): number {
   let best = 0;
   for (const o of offers.bankOffers) {
+    if (o.excludesGold || o.needsReview) continue;
     if (price < o.thresholdAmount) continue;
     let savings: number;
-    if (o.absolute) {
-      savings = o.offerAmount;
-    } else if (o.offerAmount > 50) {
-      // Cashback cap, not a percentage
-      savings = o.offerAmount;
-    } else {
-      const maxMatch = o.description.match(/(?:up\s*to|upto)\s*Rs\.?\s*([\d,]+)/i);
-      const maxCap = maxMatch ? parseInt(maxMatch[1].replace(/,/g, '')) : Infinity;
-      savings = Math.min(price * o.offerAmount / 100, maxCap);
+    switch (o.parsedType) {
+      case 'flat':
+        savings = o.parsedCap ?? o.offerAmount;
+        break;
+      case 'cashback_cap':
+        savings = o.parsedCap ?? o.offerAmount;
+        break;
+      case 'percent': {
+        const pct = o.parsedPct ?? o.offerAmount;
+        const cap = o.parsedCap ?? 1500;
+        savings = Math.min(price * pct / 100, cap);
+        break;
+      }
+      default:
+        savings = Math.min(o.offerAmount, 500);
+        break;
     }
-    // Sanity: max 25% of price
     savings = Math.min(savings, price * 0.25);
     best = Math.max(best, savings);
   }
