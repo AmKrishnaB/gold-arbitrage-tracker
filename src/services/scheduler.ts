@@ -63,23 +63,6 @@ export async function runScanCycle(): Promise<void> {
         logger.error({ error: err.message }, 'Ajio offers fetch failed');
         return cachedOffers;
       });
-
-      // Alert admin about bank offers needing review (one-time per offer cycle)
-      if (cachedOffers && config.telegramAdminChatId) {
-        const reviewOffers = cachedOffers.bankOffers.filter((o) => o.needsReview);
-        if (reviewOffers.length > 0) {
-          const lines = ['⚠️ Bank offers need review (gold exclusion unknown):\n'];
-          for (const o of reviewOffers) {
-            lines.push(`• ${o.bankName}: ${o.description.slice(0, 80)}`);
-            if (o.tncUrl) lines.push(`  T&C: ${o.tncUrl}`);
-          }
-          lines.push('\nThese offers are excluded from deal calculations until reviewed.');
-          try {
-            const { sendMessage: send } = await import('../bot/index.js');
-            await send(config.telegramAdminChatId, lines.join('\n'));
-          } catch (_) { /* bot may not be ready yet */ }
-        }
-      }
     }
 
     // 4. Detect deals

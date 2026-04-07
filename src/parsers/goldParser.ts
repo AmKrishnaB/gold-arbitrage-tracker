@@ -316,6 +316,7 @@ const INCLUDE_PATTERNS = [
   /\bcoin\b/i,
   /\bbar\b/i,
   /\bbiscuit\b/i,
+  /\bvedhani\b/i,     // 24K gold bands (P N Gadgil) — sold by weight like coins
 ];
 
 /**

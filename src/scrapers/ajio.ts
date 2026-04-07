@@ -15,13 +15,10 @@ import { retry } from '../utils/retry.js';
 const LISTING_BASE_URL =
   'https://search-edge.services.ajio.com/rilfnlwebservices/v4/rilfnl/products/category/83';
 
-const LISTING_PARAMS = {
+const LISTING_BASE_PARAMS = {
   advfilter: 'true',
-  curatedid: 'ham-gold-coins-and-bars-4775-71731',
-  curated: 'true',
   enableRushDelivery: 'false',
   urgencyDriverEnabled: 'true',
-  query: '',
   pageSize: '50',
   store: 'rilfnl',
   fields: 'FULL',
@@ -38,6 +35,29 @@ const LISTING_PARAMS = {
   is_ads_enable_plp: 'true',
   showAdsOnNextPage: 'false',
 };
+
+// Multiple queries to catch all gold items:
+// 1. Curated "Gold Coins & Bars" listing (primary — catches most 22K/24K coins and bars)
+// 2. 24K query filter (catches items in other categories like vedhanis, pendants)
+// Deduplication by product code ensures no double-counting.
+const LISTING_QUERIES: Array<{ params: Record<string, string>; label: string }> = [
+  {
+    label: 'Curated Coins & Bars',
+    params: {
+      ...LISTING_BASE_PARAMS,
+      curatedid: 'ham-gold-coins-and-bars-4775-71731',
+      curated: 'true',
+      query: '',
+    },
+  },
+  {
+    label: '24K All Categories',
+    params: {
+      ...LISTING_BASE_PARAMS,
+      query: ':relevance:verticalmetalpurity:24 Kt:verticalmetalpurity:24 Kt (995)',
+    },
+  },
+];
 
 const PDP_BASE_URL = 'https://pdpaggregator-edge.services.ajio.com/aggregator/pdp';
 
@@ -101,58 +121,73 @@ interface AjioListingResponse {
 }
 
 /**
- * Fetch a single page of Ajio gold coin/bar listings.
+ * Fetch a single page of Ajio gold listings.
  */
-async function fetchListingPage(page: number): Promise<AjioListingResponse> {
+async function fetchListingPage(page: number, params: Record<string, string>): Promise<AjioListingResponse> {
   const client = createClient();
   const res = await client.get<AjioListingResponse>(LISTING_BASE_URL, {
-    params: { ...LISTING_PARAMS, currentPage: page.toString() },
+    params: { ...params, currentPage: page.toString() },
   });
   return res.data;
 }
 
 /**
- * Fetch ALL Ajio gold coin/bar listings across all pages.
- * Pages are fetched in parallel for speed.
+ * Fetch ALL Ajio gold listings across multiple queries.
+ * Uses curated coins & bars + 24K query for expanded coverage.
+ * Deduplicates by product code.
  */
 export async function fetchAllAjioProducts(): Promise<NormalizedProduct[]> {
   const startTime = Date.now();
+  const allRaw: RawAjioProduct[] = [];
+  const seenCodes = new Set<string>();
 
-  // First page to get total count
-  const firstPage = await retry(
-    () => fetchListingPage(0),
-    { retries: 3, delayMs: 1000, label: 'Ajio page 0' },
-  );
-
-  const totalResults = firstPage.pagination?.totalResults
-    ?? firstPage.searchMetaData?.numberOfProducts
-    ?? firstPage.products.length;
-  const pageSize = firstPage.pagination?.pageSize ?? 50;
-  const totalPages = Math.ceil(totalResults / pageSize);
-
-  logger.info({ totalResults, totalPages }, 'Ajio: starting fetch');
-
-  // Fetch remaining pages in parallel
-  const pagePromises: Promise<AjioListingResponse>[] = [];
-  for (let p = 1; p < totalPages; p++) {
-    pagePromises.push(
-      retry(() => fetchListingPage(p), {
-        retries: 2,
-        delayMs: 500,
-        label: `Ajio page ${p}`,
-      }),
+  for (const { params, label } of LISTING_QUERIES) {
+    // First page to get total count for this query
+    const firstPage = await retry(
+      () => fetchListingPage(0, params),
+      { retries: 3, delayMs: 1000, label: `Ajio ${label} page 0` },
     );
-  }
 
-  const remainingPages = await Promise.allSettled(pagePromises);
+    const totalResults = firstPage.pagination?.totalResults
+      ?? firstPage.searchMetaData?.numberOfProducts
+      ?? firstPage.products.length;
+    const pageSize = firstPage.pagination?.pageSize ?? 50;
+    const totalPages = Math.ceil(totalResults / pageSize);
 
-  // Collect all raw products
-  const allRaw: RawAjioProduct[] = [...firstPage.products];
-  for (const result of remainingPages) {
-    if (result.status === 'fulfilled') {
-      allRaw.push(...result.value.products);
-    } else {
-      logger.warn({ error: result.reason?.message }, 'Ajio: page fetch failed');
+    logger.info({ query: label, totalResults, totalPages }, 'Ajio: starting query fetch');
+
+    // Dedup and collect first page
+    for (const p of firstPage.products) {
+      if (!seenCodes.has(p.code)) {
+        seenCodes.add(p.code);
+        allRaw.push(p);
+      }
+    }
+
+    // Fetch remaining pages in parallel
+    const pagePromises: Promise<AjioListingResponse>[] = [];
+    for (let p = 1; p < totalPages; p++) {
+      pagePromises.push(
+        retry(() => fetchListingPage(p, params), {
+          retries: 2,
+          delayMs: 500,
+          label: `Ajio ${label} page ${p}`,
+        }),
+      );
+    }
+
+    const remainingPages = await Promise.allSettled(pagePromises);
+    for (const result of remainingPages) {
+      if (result.status === 'fulfilled') {
+        for (const p of result.value.products) {
+          if (!seenCodes.has(p.code)) {
+            seenCodes.add(p.code);
+            allRaw.push(p);
+          }
+        }
+      } else {
+        logger.warn({ error: result.reason?.message }, 'Ajio: page fetch failed');
+      }
     }
   }
 
@@ -266,33 +301,14 @@ interface AjioPDPResponse {
   };
 }
 
-// ─── T&C Cache (per process lifetime, refreshes with restart) ───
-
-const tncCache = new Map<string, { excludesGold: boolean; cap: number | null; includesGold: boolean }>();
-
-// Known offers that explicitly include or exclude gold (from manual T&C analysis).
-// T&C pages are Akamai WAF-protected and return 403 from servers, so we maintain this list.
-// Key: substring match on bankName (lowercased)
-const KNOWN_GOLD_EXCLUDED: string[] = [
-  'rbl bank',
-  'au bank',
-];
-
-// These descriptions indicate the offer explicitly excludes gold/jewellery
-const GOLD_EXCLUSION_DESC_PATTERNS = [
-  /(?:not\s+(?:applicable|valid|include)|exclud(?:e[ds]?|ing))[^.]{0,80}?(?:gold|coin|jewel|precious)/i,
-  /(?:gold|coin|jewel|precious)[^.]{0,80}?(?:not\s+(?:applicable|valid|include)|exclud)/i,
-];
-
-// These bankName patterns are known to explicitly INCLUDE gold
-const KNOWN_GOLD_INCLUDED: string[] = [
-  '5% instant prepaid',
-  'instant prepaid',
-];
+// ─── T&C Cache — no longer used for gold exclusion ───
+// Offers are per-product: if Ajio's API serves them on a gold PDP, they're applicable.
+// We only parse descriptions for type/cap extraction.
 
 /**
  * Fetch platform-wide offers from a sentinel PDP product.
- * Enriches bank offers with parsed type/cap/gold exclusion from description + known list.
+ * Enriches bank offers with parsed type/cap from description.
+ * No gold exclusion logic — if the API serves it on gold products, it's valid.
  */
 export async function fetchAjioOffers(): Promise<PlatformOffers> {
   const client = axios.create({ timeout: 15_000, headers: PDP_HEADERS });
@@ -345,8 +361,8 @@ export async function fetchAjioOffers(): Promise<PlatformOffers> {
 // ─── Offer Enrichment ───
 
 /**
- * Parse a bank offer's description to determine type, percentage, cap.
- * Then check known exclusion lists + description for gold applicability.
+ * Parse a bank offer's description to determine type, percentage, and cap.
+ * No gold exclusion logic — if Ajio serves the offer on gold PDPs, it's applicable.
  */
 async function enrichBankOffer(raw: {
   bankName: string;
@@ -360,62 +376,7 @@ async function enrichBankOffer(raw: {
   tncUrl?: string;
   offerCode?: string;
 }): Promise<AjioBankOffer> {
-  const desc = raw.description;
-  const bankLower = raw.bankName.toLowerCase();
-
-  // Step 1: Parse description to classify offer
-  const parsed = parseOfferDescription(desc, raw.offerAmount, raw.absolute);
-
-  // Step 2: Check gold exclusion
-  let excludesGold = false;
-  let needsReview = false;
-
-  // Check known exclusion list
-  if (KNOWN_GOLD_EXCLUDED.some((k) => bankLower.includes(k))) {
-    excludesGold = true;
-  }
-
-  // Check description for exclusion patterns
-  if (!excludesGold) {
-    for (const pattern of GOLD_EXCLUSION_DESC_PATTERNS) {
-      if (pattern.test(desc)) {
-        excludesGold = true;
-        break;
-      }
-    }
-  }
-
-  // Check known gold-included offers
-  const isKnownGoldIncluded = KNOWN_GOLD_INCLUDED.some((k) => bankLower.includes(k));
-
-  // For bank-specific % offers (not generic "5% Instant PREPAID"), if not in known lists,
-  // try T&C fetch; if that fails, mark as needsReview
-  if (!excludesGold && !isKnownGoldIncluded && parsed.parsedType === 'percent' && (parsed.parsedPct ?? 0) > 5) {
-    // Try T&C if available
-    if (raw.tncUrl) {
-      const tncResult = await checkTnc(raw.tncUrl);
-      if (tncResult.excludesGold) {
-        excludesGold = true;
-      } else if (tncResult.includesGold) {
-        // Explicitly includes gold, all good
-      } else {
-        // T&C didn't help (likely 403'd) — mark for review
-        needsReview = true;
-      }
-      // Pick up cap from T&C if we didn't find one in description
-      if (tncResult.cap !== null && parsed.parsedCap === null) {
-        parsed.parsedCap = tncResult.cap;
-      }
-    } else {
-      needsReview = true;
-    }
-  }
-
-  // SBI offers: check description for "Reliance SBI" or similar patterns
-  // (SBI Reliance card explicitly excludes gold per T&C)
-  if (!excludesGold && bankLower.includes('sbi')) {
-    excludesGold = true; // Both SBI variants exclude gold
-  }
+  const parsed = parseOfferDescription(raw.description, raw.offerAmount, raw.absolute);
 
   return {
     bankName: raw.bankName,
@@ -431,8 +392,8 @@ async function enrichBankOffer(raw: {
     parsedType: parsed.parsedType,
     parsedPct: parsed.parsedPct,
     parsedCap: parsed.parsedCap,
-    excludesGold,
-    needsReview,
+    excludesGold: false,
+    needsReview: false,
   };
 }
 
@@ -496,77 +457,4 @@ function parseOfferDescription(
   return { parsedType: 'flat', parsedPct: null, parsedCap: offerAmount };
 }
 
-/**
- * Fetch and parse a T&C page for gold exclusion and cap info.
- * Results are cached per tncUrl.
- */
-async function checkTnc(tncUrl: string): Promise<{ excludesGold: boolean; includesGold: boolean; cap: number | null }> {
-  // Check cache first
-  const cached = tncCache.get(tncUrl);
-  if (cached) return cached;
 
-  const defaultResult = { excludesGold: false, includesGold: false, cap: null as number | null };
-
-  try {
-    const res = await axios.get<string>(tncUrl, {
-      timeout: 10_000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      responseType: 'text',
-    });
-
-    const text = res.data.toLowerCase();
-
-    // Check for gold exclusion patterns
-    const exclusionPatterns = [
-      /(?:not\s+(?:include|applicable|valid)|exclud(?:e[ds]?|ing))\b[^.]{0,80}?\b(?:gold|coin|jewel|precious\s*metal)/i,
-      /\b(?:gold|coin|jewel|precious\s*metal)\b[^.]{0,80}?(?:not\s+(?:include|applicable|valid)|exclud)/i,
-    ];
-
-    // Check for gold inclusion patterns (some offers explicitly say gold IS included)
-    const inclusionPatterns = [
-      /(?:include[sd]?)\b[^.]{0,80}?\b(?:gold|coin|jewel)/i,
-      /\b(?:gold|coin|jewel)\b[^.]{0,80}?(?:include[sd]?)/i,
-    ];
-
-    let excludesGold = false;
-    let includesGold = false;
-
-    for (const pattern of exclusionPatterns) {
-      if (pattern.test(text)) {
-        excludesGold = true;
-        break;
-      }
-    }
-
-    // Inclusion overrides exclusion if both somehow match (more specific)
-    for (const pattern of inclusionPatterns) {
-      if (pattern.test(text)) {
-        includesGold = true;
-        excludesGold = false;
-        break;
-      }
-    }
-
-    // Parse cap from T&C
-    let cap: number | null = null;
-    const capMatch = text.match(/(?:maximum|max)\s*(?:discount|cashback|savings?|amount)[^.]{0,40}?(?:rs\.?|₹|inr)\s*([\d,]+)/i);
-    if (capMatch) {
-      cap = parseInt(capMatch[1].replace(/,/g, ''));
-    }
-
-    const result = { excludesGold, includesGold, cap };
-    tncCache.set(tncUrl, result);
-
-    if (excludesGold) {
-      logger.debug({ tncUrl, excludesGold }, 'T&C: gold excluded');
-    } else if (includesGold) {
-      logger.debug({ tncUrl, includesGold }, 'T&C: gold explicitly included');
-    }
-
-    return result;
-  } catch (err) {
-    logger.debug({ tncUrl, error: (err as Error).message }, 'T&C fetch failed');
-    tncCache.set(tncUrl, defaultResult);
-    return defaultResult;
-  }
-}
