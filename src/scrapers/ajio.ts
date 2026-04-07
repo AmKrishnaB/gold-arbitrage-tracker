@@ -12,8 +12,8 @@ import { retry } from '../utils/retry.js';
 
 // ─── Ajio API Config ───
 
-const LISTING_BASE_URL =
-  'https://search-edge.services.ajio.com/rilfnlwebservices/v4/rilfnl/products/category/83';
+const LISTING_URL_BASE =
+  'https://search-edge.services.ajio.com/rilfnlwebservices/v4/rilfnl/products/category';
 
 const LISTING_BASE_PARAMS = {
   advfilter: 'true',
@@ -36,13 +36,14 @@ const LISTING_BASE_PARAMS = {
   showAdsOnNextPage: 'false',
 };
 
-// Multiple queries to catch all gold items:
-// 1. Curated "Gold Coins & Bars" listing (primary — catches most 22K/24K coins and bars)
-// 2. 24K query filter (catches items in other categories like vedhanis, pendants)
-// Deduplication by product code ensures no double-counting.
-const LISTING_QUERIES: Array<{ params: Record<string, string>; label: string }> = [
+// Multiple queries across categories to catch all gold items:
+// 1. Curated "Gold Coins & Bars" (category 83) — primary, catches most 22K/24K coins and bars
+// 2. 24K filter on all jewellery (category 83) — catches items in sub-categories
+// 3. Women Rings category (830306004) with 24K filter — catches vedhanis (24K gold bands)
+const LISTING_QUERIES: Array<{ url: string; params: Record<string, string>; label: string }> = [
   {
     label: 'Curated Coins & Bars',
+    url: `${LISTING_URL_BASE}/83`,
     params: {
       ...LISTING_BASE_PARAMS,
       curatedid: 'ham-gold-coins-and-bars-4775-71731',
@@ -52,6 +53,15 @@ const LISTING_QUERIES: Array<{ params: Record<string, string>; label: string }> 
   },
   {
     label: '24K All Categories',
+    url: `${LISTING_URL_BASE}/83`,
+    params: {
+      ...LISTING_BASE_PARAMS,
+      query: ':relevance:verticalmetalpurity:24 Kt:verticalmetalpurity:24 Kt (995)',
+    },
+  },
+  {
+    label: '24K Rings (Vedhanis)',
+    url: `${LISTING_URL_BASE}/830306004`,
     params: {
       ...LISTING_BASE_PARAMS,
       query: ':relevance:verticalmetalpurity:24 Kt:verticalmetalpurity:24 Kt (995)',
@@ -123,9 +133,9 @@ interface AjioListingResponse {
 /**
  * Fetch a single page of Ajio gold listings.
  */
-async function fetchListingPage(page: number, params: Record<string, string>): Promise<AjioListingResponse> {
+async function fetchListingPage(page: number, url: string, params: Record<string, string>): Promise<AjioListingResponse> {
   const client = createClient();
-  const res = await client.get<AjioListingResponse>(LISTING_BASE_URL, {
+  const res = await client.get<AjioListingResponse>(url, {
     params: { ...params, currentPage: page.toString() },
   });
   return res.data;
@@ -141,10 +151,10 @@ export async function fetchAllAjioProducts(): Promise<NormalizedProduct[]> {
   const allRaw: RawAjioProduct[] = [];
   const seenCodes = new Set<string>();
 
-  for (const { params, label } of LISTING_QUERIES) {
+  for (const { url, params, label } of LISTING_QUERIES) {
     // First page to get total count for this query
     const firstPage = await retry(
-      () => fetchListingPage(0, params),
+      () => fetchListingPage(0, url, params),
       { retries: 3, delayMs: 1000, label: `Ajio ${label} page 0` },
     );
 
@@ -168,7 +178,7 @@ export async function fetchAllAjioProducts(): Promise<NormalizedProduct[]> {
     const pagePromises: Promise<AjioListingResponse>[] = [];
     for (let p = 1; p < totalPages; p++) {
       pagePromises.push(
-        retry(() => fetchListingPage(p, params), {
+        retry(() => fetchListingPage(p, url, params), {
           retries: 2,
           delayMs: 500,
           label: `Ajio ${label} page ${p}`,
