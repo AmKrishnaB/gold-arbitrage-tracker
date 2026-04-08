@@ -3,12 +3,6 @@ import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { retry } from '../utils/retry.js';
 
-interface EarnKaroResponse {
-  status: string;
-  long_url?: string;
-  message?: string;
-}
-
 /**
  * Generate an EarnKaro affiliate link for a product URL.
  */
@@ -21,7 +15,7 @@ export async function generateAffiliateLink(productUrl: string): Promise<string>
   try {
     const result = await retry(
       async () => {
-        const res = await axios.post<EarnKaroResponse>(
+        const res = await axios.post(
           'https://ekaro-api.affiliaters.in/api/converter/public',
           {
             deal: productUrl,
@@ -35,19 +29,45 @@ export async function generateAffiliateLink(productUrl: string): Promise<string>
             timeout: 10_000,
           },
         );
+
+        logger.debug(
+          { status: res.status, data: JSON.stringify(res.data).slice(0, 500), inputUrl: productUrl },
+          'EarnKaro: raw API response',
+        );
+
         return res.data;
       },
       { retries: 2, delayMs: 1000, label: 'EarnKaro' },
     );
 
-    if (result.long_url) {
-      return result.long_url;
+    // Check all possible URL fields the API might return
+    const affiliateUrl = result.long_url || result.longUrl || result.url || result.link
+      || result.affiliate_url || result.converted_url || result.short_url
+      || (result.data && typeof result.data === 'string' ? result.data : null)
+      || (result.data?.long_url) || (result.data?.url);
+
+    if (affiliateUrl) {
+      logger.debug({ original: productUrl, affiliate: affiliateUrl }, 'EarnKaro: link generated');
+      return affiliateUrl;
     }
 
-    logger.warn({ status: result.status, message: result.message }, 'EarnKaro: no link returned');
+    logger.warn(
+      { responseKeys: Object.keys(result), response: JSON.stringify(result).slice(0, 300) },
+      'EarnKaro: no affiliate URL found in response',
+    );
     return productUrl;
   } catch (err) {
-    logger.error({ error: (err as Error).message, url: productUrl }, 'EarnKaro: link generation failed');
+    const axiosErr = err as any;
+    const responseData = axiosErr?.response?.data;
+    logger.error(
+      {
+        error: (err as Error).message,
+        url: productUrl,
+        httpStatus: axiosErr?.response?.status,
+        responseData: responseData ? JSON.stringify(responseData).slice(0, 300) : undefined,
+      },
+      'EarnKaro: link generation failed',
+    );
     return productUrl;
   }
 }
