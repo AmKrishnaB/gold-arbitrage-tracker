@@ -5,6 +5,7 @@ import type {
   AjioPromo,
   AjioBankOffer,
   PlatformOffers,
+  ProductOffers,
 } from '../config/types.js';
 import { parseGoldData, shouldTrackProduct, validateParsedProduct } from '../parsers/goldParser.js';
 import { logger } from '../utils/logger.js';
@@ -465,6 +466,104 @@ function parseOfferDescription(
 
   // Small offerAmount, no % in desc — treat as flat (e.g., "Rs 15 cashback" without "Flat" prefix)
   return { parsedType: 'flat', parsedPct: null, parsedCap: offerAmount };
+}
+
+// ─── Per-Product PDP Fetch ───
+
+/**
+ * Extract the Ajio PDP code from a product ID.
+ * Product IDs are like "ajio:600752912" or "ajio:6006341870_multi"
+ * The PDP API works with both short codes (600752912) and full variant codes (6007529120_multi).
+ * Use the code as-is from the product listing — no need to append _multi.
+ */
+function getAjioPdpCode(product: NormalizedProduct): string {
+  return product.id.replace(/^ajio:/, '');
+}
+
+/**
+ * Fetch real offers (promos + bank offers) for a specific Ajio product via its PDP.
+ * Returns null if the PDP call fails.
+ */
+export async function fetchProductPDP(product: NormalizedProduct): Promise<ProductOffers | null> {
+  const code = getAjioPdpCode(product);
+  const client = axios.create({ timeout: 15_000, headers: PDP_HEADERS });
+
+  try {
+    const url = `${PDP_BASE_URL}/${code}?sortOptionsByColor=true&client_type=Android&client_version=9.31.1&isNewUser=true&tagVersionTwo=false&applyExperiment=false&fields=FULL`;
+    const res = await client.get<AjioPDPResponse>(url);
+    const data = res.data;
+
+    const promos: AjioPromo[] = (data.potentialPromotions ?? []).map((p) => ({
+      code: p.code,
+      description: p.description,
+      maxSavingPrice: p.maxSavingPrice,
+      endTime: p.endTime,
+      restrictedToNewUser: p.restrictedToNewUser,
+    }));
+
+    const rawOffers = data.prepaidOffers ?? [];
+    const bankOffers: AjioBankOffer[] = [];
+    for (const o of rawOffers) {
+      const enriched = await enrichBankOffer(o);
+      bankOffers.push(enriched);
+    }
+
+    logger.debug(
+      { code, promos: promos.length, bankOffers: bankOffers.length },
+      'Ajio: PDP offers fetched for product',
+    );
+
+    return {
+      productId: product.id,
+      promos,
+      bankOffers,
+      fetchedAt: Date.now(),
+    };
+  } catch (err) {
+    logger.warn(
+      { code, error: (err as Error).message },
+      'Ajio: PDP fetch failed for product',
+    );
+    return null;
+  }
+}
+
+/**
+ * Fetch PDP offers for multiple products with concurrency control.
+ * Returns a Map of productId → ProductOffers.
+ */
+export async function fetchProductPDPs(
+  products: NormalizedProduct[],
+  concurrency = 5,
+): Promise<Map<string, ProductOffers>> {
+  const results = new Map<string, ProductOffers>();
+  
+  // Process in batches to respect rate limits
+  for (let i = 0; i < products.length; i += concurrency) {
+    const batch = products.slice(i, i + concurrency);
+    const batchResults = await Promise.allSettled(
+      batch.map((p) => fetchProductPDP(p)),
+    );
+
+    for (let j = 0; j < batchResults.length; j++) {
+      const result = batchResults[j];
+      if (result.status === 'fulfilled' && result.value) {
+        results.set(batch[j].id, result.value);
+      }
+    }
+
+    // Small delay between batches to avoid rate limiting
+    if (i + concurrency < products.length) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+
+  logger.info(
+    { requested: products.length, fetched: results.size },
+    'Ajio: PDP batch fetch complete',
+  );
+
+  return results;
 }
 
 

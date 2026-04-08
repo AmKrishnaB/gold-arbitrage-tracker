@@ -186,6 +186,17 @@ export interface PlatformOffers {
   fetchedAt: number;
 }
 
+/**
+ * Per-product offers fetched from PDP.
+ * These are the REAL offers for a specific product.
+ */
+export interface ProductOffers {
+  productId: string;
+  promos: AjioPromo[];
+  bankOffers: AjioBankOffer[];
+  fetchedAt: number;
+}
+
 // ─── Deal Types ───
 
 export interface Deal {
@@ -197,6 +208,7 @@ export interface Deal {
 
   // Ajio-specific additional savings
   promoSavings: number;
+  appliedPromoCode?: string;          // e.g., "DHANVARSHA2"
   bestBankOffer?: AjioBankOffer;
   bankOfferSavings: number;
   topBankOffers: BankOfferResult[];   // Top 3 applicable offers with calculated savings

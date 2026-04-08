@@ -5,9 +5,7 @@ import { activeDeals, sentMessages, subscribers } from '../db/schema.js';
 import { eq, and } from 'drizzle-orm';
 import { formatDealMessage, formatExpiredMessage } from '../bot/templates.js';
 import { sendMessage, editMessage, getActiveSubscribers } from '../bot/index.js';
-import { generatePromoHash } from './dealDetector.js';
 import { logger } from '../utils/logger.js';
-import type { PlatformOffers } from '../config/types.js';
 
 /**
  * Process newly detected deals — decide whether to send new notification,
@@ -16,7 +14,6 @@ import type { PlatformOffers } from '../config/types.js';
 export async function processDeals(
   deals: Deal[],
   allProducts: NormalizedProduct[],
-  offers?: PlatformOffers,
 ): Promise<void> {
   const db = getDB();
   const now = Date.now();
@@ -29,17 +26,16 @@ export async function processDeals(
   const currentDealProductIds = new Set(deals.map((d) => d.product.id));
 
   // ─── Handle NEW and UPDATED deals ───
-  const promoHash = offers ? generatePromoHash(offers) : '';
 
   for (const deal of deals) {
     const existing = existingMap.get(deal.product.id);
 
     if (!existing) {
       // NEW DEAL — never seen before
-      await handleNewDeal(deal, promoHash);
+      await handleNewDeal(deal);
     } else {
       // EXISTING DEAL — check if we should update
-      await handleExistingDeal(deal, existing, promoHash);
+      await handleExistingDeal(deal, existing);
     }
   }
 
@@ -55,7 +51,7 @@ export async function processDeals(
 /**
  * Handle a newly discovered deal.
  */
-async function handleNewDeal(deal: Deal, promoHash: string): Promise<void> {
+async function handleNewDeal(deal: Deal): Promise<void> {
   const db = getDB();
   const now = Date.now();
 
@@ -79,7 +75,7 @@ async function handleNewDeal(deal: Deal, promoHash: string): Promise<void> {
     lastNotifiedAt: now,
     lastNotifiedPrice: deal.finalPrice,
     lastNotifiedSavingsPct: deal.totalSavingsPct,
-    lastPromoHash: promoHash,
+    lastPromoHash: '',
     currentPrice: deal.finalPrice,
     currentSavingsPct: deal.totalSavingsPct,
     marketValue: deal.marketValue,
@@ -116,7 +112,6 @@ async function handleNewDeal(deal: Deal, promoHash: string): Promise<void> {
 async function handleExistingDeal(
   deal: Deal,
   existing: typeof activeDeals.$inferSelect,
-  promoHash: string,
 ): Promise<void> {
   const db = getDB();
   const now = Date.now();
@@ -132,7 +127,6 @@ async function handleExistingDeal(
 
   // Check what changed
   const priceDrop = deal.finalPrice < existing.lastNotifiedPrice;
-  const promoChanged = promoHash !== existing.lastPromoHash && promoHash !== '';
   const savingsChange = Math.abs(deal.totalSavingsPct - existing.lastNotifiedSavingsPct);
 
   // Determine action
@@ -148,23 +142,9 @@ async function handleExistingDeal(
       lastNotifiedAt: now,
       lastNotifiedPrice: deal.finalPrice,
       lastNotifiedSavingsPct: deal.totalSavingsPct,
-      lastPromoHash: promoHash,
     }).where(eq(activeDeals.id, existing.id));
 
     logger.info({ productId: existing.productId, priceDrop: true, savingsChange: savingsChange.toFixed(1) }, 'Deal updated (price drop)');
-  } else if (promoChanged && cooldownPassed) {
-    // New promo/bank offer
-    const affiliateUrl = deal.affiliateUrl || deal.product.url;
-    const text = formatDealMessage(deal, affiliateUrl, 'better_offer');
-    await editBroadcast(existing.id, text);
-
-    await db.update(activeDeals).set({
-      lastNotifiedAt: now,
-      lastPromoHash: promoHash,
-      lastNotifiedSavingsPct: deal.totalSavingsPct,
-    }).where(eq(activeDeals.id, existing.id));
-
-    logger.info({ productId: existing.productId, promoChanged: true }, 'Deal updated (better offer)');
   } else if (savingsChange >= config.silentEditThresholdPct && cooldownPassed) {
     // Market moved enough for silent edit
     const affiliateUrl = deal.affiliateUrl || deal.product.url;

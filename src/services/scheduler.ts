@@ -3,7 +3,6 @@ import { config } from '../config/index.js';
 import { fetchIBJARates, getCachedRates } from './goldRate.js';
 import { fetchAllAjioProducts } from '../scrapers/ajio.js';
 import { fetchAllMyntraProducts } from '../scrapers/myntra.js';
-import { fetchAjioOffers } from '../scrapers/ajio.js';
 import { detectDeals } from './dealDetector.js';
 import { generateAffiliateLink } from './earnkaro.js';
 import { processDeals } from './notifier.js';
@@ -12,17 +11,16 @@ import { getDB } from '../db/index.js';
 import { products, scanLog, ibjaRateHistory } from '../db/schema.js';
 import { sql } from 'drizzle-orm';
 import { logger } from '../utils/logger.js';
-import type { NormalizedProduct, PlatformOffers } from '../config/types.js';
+import type { NormalizedProduct } from '../config/types.js';
 
 let scanRunning = false;
-let cachedOffers: PlatformOffers | null = null;
 
 /**
  * Run a full scan cycle:
  * 1. Fetch IBJA rates (if stale)
  * 2. Fetch products from Ajio + Myntra
- * 3. Fetch Ajio offers (promos + bank)
- * 4. Detect deals
+ * 3. Detect deals (pre-filter → PDP verification → real offers)
+ * 4. Generate affiliate links
  * 5. Process notifications
  */
 export async function runScanCycle(): Promise<void> {
@@ -58,16 +56,8 @@ export async function runScanCycle(): Promise<void> {
     // 3. Upsert all products into DB (required before deal detection — FK constraint)
     await upsertProducts(allProducts);
 
-    // 4. Fetch Ajio offers (cached for 1 hour)
-    if (!cachedOffers || Date.now() - cachedOffers.fetchedAt > 60 * 60 * 1000) {
-      cachedOffers = await fetchAjioOffers().catch((err) => {
-        logger.error({ error: err.message }, 'Ajio offers fetch failed');
-        return cachedOffers;
-      });
-    }
-
-    // 4. Detect deals
-    const deals = detectDeals(allProducts, rates, cachedOffers ?? undefined);
+    // 4. Detect deals (2-phase: pre-filter → PDP verify with real offers)
+    const deals = await detectDeals(allProducts, rates);
 
     // 5. Generate affiliate links for all deals
     if (deals.length > 0) {
@@ -82,7 +72,7 @@ export async function runScanCycle(): Promise<void> {
 
     // 6. Process notifications
     if (deals.length > 0) {
-      await processDeals(deals, allProducts, cachedOffers ?? undefined);
+      await processDeals(deals, allProducts);
     }
 
     // Log scan results

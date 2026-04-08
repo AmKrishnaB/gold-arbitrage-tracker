@@ -3,42 +3,103 @@ import type {
   Deal,
   BankOfferResult,
   PlatformOffers,
+  ProductOffers,
   AjioBankOffer,
   GoldRates,
   Fineness,
 } from '../config/types.js';
+import { fetchProductPDPs } from '../scrapers/ajio.js';
 import { logger } from '../utils/logger.js';
 
 /**
- * Detect deals from a list of normalized products against IBJA rates.
- * Optionally factors in Ajio promo codes and bank offers.
+ * Pre-filter threshold: products priced up to this % above IBJA spot
+ * are considered candidates for PDP verification.
+ * e.g., 1.10 means products up to 10% above spot are checked.
  */
-export function detectDeals(
+const CANDIDATE_THRESHOLD = 1.10;
+
+/**
+ * Detect deals using 2-phase approach:
+ * Phase 1: Pre-filter — find candidates whose listing price is within 5% above IBJA spot
+ * Phase 2: PDP verify — fetch real per-product offers from Ajio PDP, recalculate with actual promos & bank offers
+ *
+ * For Myntra products (no PDP offers), deal detection uses listing price only.
+ */
+export async function detectDeals(
   products: NormalizedProduct[],
   rates: GoldRates,
   offers?: PlatformOffers,
-): Deal[] {
+): Promise<Deal[]> {
   const deals: Deal[] = [];
 
+  // ─── Phase 1: Pre-filter candidates ───
+  const ajioCandidates: NormalizedProduct[] = [];
+  const myntraProducts: NormalizedProduct[] = [];
+
   for (const product of products) {
-    const deal = evaluateProduct(product, rates, offers);
+    if (product.platform === 'myntra') {
+      myntraProducts.push(product);
+      continue;
+    }
+
+    // Ajio: check if listing price is within threshold of market value
+    const ibjaRate = getRate(rates, product.fineness);
+    if (ibjaRate <= 0) continue;
+
+    const marketValue = product.totalWeightGrams * ibjaRate;
+    if (marketValue <= 0) continue;
+
+    // Price sanity check: skip if price > 1.5x spot
+    const pricePerGram = product.effectivePrice / product.totalWeightGrams;
+    if (pricePerGram > ibjaRate * 1.5) continue;
+
+    // Candidate if listing price is within threshold (5% above spot)
+    if (product.effectivePrice <= marketValue * CANDIDATE_THRESHOLD) {
+      ajioCandidates.push(product);
+    }
+  }
+
+  logger.info(
+    { ajioCandidates: ajioCandidates.length, myntra: myntraProducts.length },
+    'Deal detection: Phase 1 pre-filter complete',
+  );
+
+  // ─── Phase 2: Fetch PDP for Ajio candidates ───
+  let pdpOffers = new Map<string, ProductOffers>();
+  if (ajioCandidates.length > 0) {
+    pdpOffers = await fetchProductPDPs(ajioCandidates, 5);
+  }
+
+  // Evaluate Ajio candidates with real PDP offers
+  for (const product of ajioCandidates) {
+    const productPDP = pdpOffers.get(product.id);
+    const deal = evaluateProduct(product, rates, productPDP);
+    if (deal) deals.push(deal);
+  }
+
+  // Evaluate Myntra products (no PDP/offers)
+  for (const product of myntraProducts) {
+    const deal = evaluateProduct(product, rates);
     if (deal) deals.push(deal);
   }
 
   // Sort by total savings % descending (best deals first)
   deals.sort((a, b) => b.totalSavingsPct - a.totalSavingsPct);
 
+  logger.info({ deals: deals.length }, 'Deal detection: Phase 2 complete');
+
   return deals;
 }
 
 /**
  * Evaluate a single product for deal potential.
- * Returns a Deal if the product is priced below market value, null otherwise.
+ * For Ajio: uses real per-product PDP offers (promos + bank offers).
+ * For Myntra: uses listing price only.
  */
 function evaluateProduct(
   product: NormalizedProduct,
   rates: GoldRates,
-  offers?: PlatformOffers,
+  productOffers?: ProductOffers | null,
 ): Deal | null {
   // Get IBJA rate for this product's fineness
   const ibjaRate = getRate(rates, product.fineness);
@@ -51,17 +112,20 @@ function evaluateProduct(
   // Base effective price (already the lowest of mrp/selling/offer/coupon)
   let finalPrice = product.effectivePrice;
   let promoSavings = 0;
+  let appliedPromoCode: string | undefined;
   let bankOfferSavings = 0;
   let bestBankOffer: AjioBankOffer | undefined;
   let topBankOffers: BankOfferResult[] = [];
 
-  // Apply Ajio promo codes and bank offers
-  if (product.platform === 'ajio' && offers?.platform === 'ajio') {
-    // Promo code savings
-    promoSavings = calculatePromoSavings(finalPrice, offers.promos);
+  // Apply real PDP offers for Ajio products
+  if (product.platform === 'ajio' && productOffers) {
+    // Promo code savings (from real PDP)
+    const promoResult = calculatePromoSavings(finalPrice, productOffers.promos);
+    promoSavings = promoResult.savings;
+    appliedPromoCode = promoResult.promoCode;
 
     // Bank offer savings (calculated on original price, not after promo)
-    const bankResult = calculateTopBankOffers(product.effectivePrice, offers.bankOffers);
+    const bankResult = calculateTopBankOffers(product.effectivePrice, productOffers.bankOffers);
     topBankOffers = bankResult;
     if (bankResult.length > 0) {
       bestBankOffer = bankResult[0].offer;
@@ -90,6 +154,7 @@ function evaluateProduct(
     savings,
     savingsPct,
     promoSavings,
+    appliedPromoCode,
     bestBankOffer,
     bankOfferSavings,
     topBankOffers,
@@ -123,18 +188,19 @@ function getRate(rates: GoldRates, fineness: Fineness): number {
 /**
  * Calculate savings from promo codes.
  * Takes the best applicable promo.
+ * Returns savings amount and the promo code that achieved it.
  */
 function calculatePromoSavings(
   price: number,
-  promos: PlatformOffers['promos'],
-): number {
+  promos: ProductOffers['promos'],
+): { savings: number; promoCode?: string } {
   let bestSavings = 0;
+  let bestCode: string | undefined;
 
   for (const promo of promos) {
     if (promo.restrictedToNewUser) continue;
 
     // Parse the promo description to extract discount details
-    // Example: "Get additional 2% off upto Rs. 2000/- on cart value of Rs. 9,999/-"
     const pctMatch = promo.description.match(/(\d+)%\s*off/i);
     const maxMatch = promo.description.match(/upto\s*Rs\.?\s*([\d,]+)/i);
     const minMatch = promo.description.match(/(?:cart value|minimum|min).*?Rs\.?\s*([\d,]+)/i);
@@ -148,10 +214,13 @@ function calculatePromoSavings(
     if (price < minOrder) continue;
 
     const discount = Math.min(price * pct / 100, maxCap);
-    bestSavings = Math.max(bestSavings, discount);
+    if (discount > bestSavings) {
+      bestSavings = discount;
+      bestCode = promo.code;
+    }
   }
 
-  return Math.round(bestSavings);
+  return { savings: Math.round(bestSavings), promoCode: bestCode };
 }
 
 /**

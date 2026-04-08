@@ -2,6 +2,26 @@ import type { Deal, DealStatus } from '../config/types.js';
 
 /**
  * Format a deal as a Telegram message.
+ *
+ * Layout:
+ *   Status line
+ *   Product name / Brand / Platform
+ *   Weight / Purity
+ *
+ *   💰 Listed Price: ₹X,XXX
+ *   🎫 Promo (CODE): -₹XXX
+ *   🏦 Best Prepaid Offer: -₹XXX (Bank, UPI/Card)
+ *   💵 Final Price: ₹X,XXX
+ *
+ *   📉 IBJA Rate + Market Value
+ *   ✅ Savings line
+ *
+ *   🏦 Other Offers:
+ *     • Bank2: -₹XXX (Card)
+ *     • Bank3: -₹XXX (UPI)
+ *
+ *   Affiliate link
+ *   Timestamp
  */
 export function formatDealMessage(
   deal: Deal,
@@ -25,45 +45,52 @@ export function formatDealMessage(
     '',
   ];
 
-  // Price breakdown
-  if (product.mrp !== product.sellingPrice) {
-    lines.push(`💰 MRP: ${fmtRs(product.mrp)} → ${fmtRs(product.sellingPrice)} (${product.discountPercent}% OFF)`);
-  } else {
-    lines.push(`💰 Price: ${fmtRs(product.sellingPrice)}`);
+  // ─── Price Breakdown ───
+
+  // Listed price (the price on the product page)
+  lines.push(`💰 Listed Price: ${fmtRs(product.effectivePrice)}`);
+
+  // Show MRP strikethrough if different
+  if (product.mrp > product.effectivePrice) {
+    lines.push(`   (MRP ${fmtRs(product.mrp)}, ${product.discountPercent}% OFF)`);
   }
 
-  if (product.offerPrice && product.offerPrice < product.sellingPrice) {
-    lines.push(`🏷️ Offer Price: ${fmtRs(product.offerPrice)}`);
-  }
-
-  if (product.couponPrice) {
-    lines.push(`🎫 Coupon Price: ${fmtRs(product.couponPrice)} (apply coupon on ${platformLabel})`);
-  }
-
-  // Ajio promo
+  // Promo discount
   if (deal.promoSavings > 0) {
-    lines.push(`🎫 Promo Savings: -${fmtRs(deal.promoSavings)} (apply at checkout)`);
+    const promoLabel = deal.appliedPromoCode ? ` (${deal.appliedPromoCode})` : '';
+    lines.push(`🎫 Promo${promoLabel}: -${fmtRs(deal.promoSavings)}`);
   }
 
-  // Top 3 bank/wallet offers
+  // Best prepaid/bank offer (top 1) — full description
   if (deal.topBankOffers.length > 0) {
-    for (const bo of deal.topBankOffers) {
-      const instruments = formatInstruments(bo.offer.eligiblePaymentInstruments);
-      lines.push(`🏦 ${bo.offer.bankName}: -${fmtRs(bo.savings)}${instruments ? ` (${instruments})` : ''}`);
-    }
-  } else if (deal.bankOfferSavings > 0 && deal.bestBankOffer) {
-    // Fallback for legacy
-    lines.push(`🏦 ${deal.bestBankOffer.bankName}: -${fmtRs(deal.bankOfferSavings)}`);
+    const top = deal.topBankOffers[0];
+    lines.push(`🏦 ${top.offer.bankName}: -${fmtRs(top.savings)}`);
+    lines.push(`   ${top.offer.description}`);
   }
 
-  if (deal.finalPrice < deal.effectivePrice) {
-    lines.push(`💵 Best Price: ${fmtRs(deal.finalPrice)}`);
+  // Final price after all discounts
+  if (deal.finalPrice < product.effectivePrice) {
+    lines.push(`💵 Final Price: ${fmtRs(deal.finalPrice)}`);
   }
 
   lines.push('');
+
+  // ─── Market Comparison ───
   lines.push(`📉 IBJA ${ibjaSession} Rate: ${fmtRs(ibjaRate)}/gm (${purityLabel})`);
   lines.push(`📊 Market Value: ${fmtRs(marketValue)}`);
   lines.push(`✅ You Save: ${fmtRs(totalSavings)} (${totalSavingsPct.toFixed(1)}%)${totalSavingsPct >= 5 ? ' 🔥' : ''}`);
+
+  // ─── Other Bank Offers (2nd & 3rd) ───
+  if (deal.topBankOffers.length > 1) {
+    lines.push('');
+    lines.push('🏦 Other Offers:');
+    for (let i = 1; i < deal.topBankOffers.length; i++) {
+      const bo = deal.topBankOffers[i];
+      const instruments = formatInstruments(bo.offer.eligiblePaymentInstruments);
+      lines.push(`  • ${bo.offer.bankName}: -${fmtRs(bo.savings)}${instruments ? ` (${instruments})` : ''}`);
+    }
+  }
+
   lines.push('');
   lines.push(affiliateUrl);
   lines.push(`⏰ ${formatTime(deal.detectedAt)}`);
@@ -124,35 +151,62 @@ export function formatGoldRateMessage(
 }
 
 /**
- * Format a deals summary (for /deals command).
- * Shows top 10 deals with links.
+ * Number of deals per page in /deals pagination.
  */
-export function formatDealsSummary(deals: Deal[]): string {
+export const DEALS_PAGE_SIZE = 5;
+
+/**
+ * Format a deals summary (for /deals command).
+ * Shows a page of deals with pagination info.
+ */
+export function formatDealsSummary(deals: Deal[], page = 0): string {
   if (deals.length === 0) {
     return '📋 No active gold deals right now.\n\nI\'m scanning Myntra & Ajio every few minutes. You\'ll be notified when a deal appears!';
   }
 
+  const totalPages = Math.ceil(deals.length / DEALS_PAGE_SIZE);
+  const start = page * DEALS_PAGE_SIZE;
+  const end = Math.min(start + DEALS_PAGE_SIZE, deals.length);
+  const pageDeals = deals.slice(start, end);
+
   const lines = [
-    `📋 Top Gold Deals (${Math.min(deals.length, 10)} of ${deals.length})`,
+    `📋 Gold Deals (${start + 1}–${end} of ${deals.length})  •  Page ${page + 1}/${totalPages}`,
     '',
   ];
 
-  for (const deal of deals.slice(0, 10)) {
+  for (const deal of pageDeals) {
     const platform = deal.product.platform === 'ajio' ? 'Ajio' : 'Myntra';
     const purityLabel = deal.product.karat === 24 ? '24K' : `${deal.product.karat}K`;
     const fire = deal.totalSavingsPct >= 5 ? '🔥' : '✅';
+
     lines.push(
       `${fire} ${deal.product.brand} ${deal.product.totalWeightGrams}g ${purityLabel} — ${platform}`,
     );
-    lines.push(
-      `   ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
-    );
+
+    // Show listed price and final price
+    if (deal.finalPrice < deal.effectivePrice) {
+      lines.push(
+        `   ${fmtRs(deal.effectivePrice)} → ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
+      );
+    } else {
+      lines.push(
+        `   ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
+      );
+    }
+
+    // Promo coupon code
+    if (deal.promoSavings > 0 && deal.appliedPromoCode) {
+      lines.push(`   🎫 Use code: ${deal.appliedPromoCode} (-${fmtRs(deal.promoSavings)})`);
+    }
+
+    // Top 1 bank offer — full description
+    if (deal.topBankOffers.length > 0) {
+      const top = deal.topBankOffers[0];
+      lines.push(`   🏦 ${top.offer.description}`);
+    }
+
     lines.push(`   ${deal.affiliateUrl || deal.product.url}`);
     lines.push('');
-  }
-
-  if (deals.length > 10) {
-    lines.push(`... and ${deals.length - 10} more deals`);
   }
 
   return lines.join('\n');

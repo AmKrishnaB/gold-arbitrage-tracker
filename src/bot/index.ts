@@ -1,11 +1,11 @@
-import { Bot, type Context } from 'grammy';
+import { Bot, InlineKeyboard, type Context } from 'grammy';
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { getDB } from '../db/index.js';
-import { subscribers } from '../db/schema.js';
+import { subscribers, activeDeals, sentMessages } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { getCachedRates } from '../services/goldRate.js';
-import { formatGoldRateMessage, formatDealsSummary } from './templates.js';
+import { formatGoldRateMessage, formatDealsSummary, DEALS_PAGE_SIZE } from './templates.js';
 import type { Deal } from '../config/types.js';
 
 let bot: Bot;
@@ -68,7 +68,31 @@ export function initBot(): Bot {
   });
 
   bot.command('deals', async (ctx) => {
-    await ctx.reply(formatDealsSummary(activeDealsList));
+    const page = 0;
+    const text = formatDealsSummary(activeDealsList, page);
+    const keyboard = buildDealsKeyboard(page, activeDealsList.length);
+    await ctx.reply(text, { reply_markup: keyboard ?? undefined });
+  });
+
+  // ─── Inline Keyboard: Deals Pagination ───
+
+  bot.callbackQuery(/^deals_page:(\d+)$/, async (ctx) => {
+    const page = parseInt(ctx.match![1]);
+    const text = formatDealsSummary(activeDealsList, page);
+    const keyboard = buildDealsKeyboard(page, activeDealsList.length);
+    try {
+      await ctx.editMessageText(text, { reply_markup: keyboard ?? undefined });
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      if (!errMsg.includes('message is not modified')) {
+        logger.error({ error: errMsg }, 'Failed to edit deals page');
+      }
+    }
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('deals_page_noop', async (ctx) => {
+    await ctx.answerCallbackQuery();
   });
 
   bot.command('settings', async (ctx) => {
@@ -143,6 +167,12 @@ export function initBot(): Bot {
     // The scheduler will pick this up via an event or direct call
   });
 
+  bot.command('force_resend', async (ctx) => {
+    if (ctx.chat.id.toString() !== config.telegramAdminChatId) return;
+    await clearDealHistory();
+    await ctx.reply('🗑️ Deal history cleared. All deals in the next scan will be sent as new notifications.');
+  });
+
   // Error handling
   bot.catch((err) => {
     logger.error({ error: err.message }, 'Bot error');
@@ -158,6 +188,42 @@ export function getBot(): Bot {
 
 export function updateActiveDeals(deals: Deal[]) {
   activeDealsList = deals;
+}
+
+/**
+ * Build inline keyboard for deals pagination.
+ * Returns null if only one page (no buttons needed).
+ */
+function buildDealsKeyboard(page: number, totalDeals: number): InlineKeyboard | null {
+  const totalPages = Math.ceil(totalDeals / DEALS_PAGE_SIZE);
+  if (totalPages <= 1) return null;
+
+  const keyboard = new InlineKeyboard();
+
+  if (page > 0) {
+    keyboard.text('◀️ Prev', `deals_page:${page - 1}`);
+  }
+
+  keyboard.text(`${page + 1} / ${totalPages}`, 'deals_page_noop');
+
+  if (page < totalPages - 1) {
+    keyboard.text('Next ▶️', `deals_page:${page + 1}`);
+  }
+
+  return keyboard;
+}
+
+/**
+ * Clear all active deals and sent message records from DB.
+ * This forces the next scan cycle to treat all deals as NEW and re-send notifications.
+ */
+export async function clearDealHistory(): Promise<void> {
+  const db = getDB();
+  // Delete all sent messages first (FK constraint)
+  await db.delete(sentMessages).run();
+  // Delete all active deals
+  await db.delete(activeDeals).run();
+  logger.info('Deal history cleared — next scan will re-notify all deals');
 }
 
 /**
