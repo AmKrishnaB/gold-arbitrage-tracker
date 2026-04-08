@@ -72,7 +72,13 @@ export async function runScanCycle(): Promise<void> {
 
     // 6. Process notifications
     if (deals.length > 0) {
-      await processDeals(deals, allProducts);
+      logger.info({ deals: deals.length }, 'Starting processDeals...');
+      try {
+        await processDeals(deals, allProducts);
+        logger.info('processDeals completed');
+      } catch (err) {
+        logger.error({ error: (err as Error).message, stack: (err as Error).stack }, 'processDeals FAILED');
+      }
     }
 
     // Log scan results

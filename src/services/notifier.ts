@@ -22,6 +22,11 @@ export async function processDeals(
   const existingDeals = await db.select().from(activeDeals).where(eq(activeDeals.status, 'active')).all();
   const existingMap = new Map(existingDeals.map((d) => [d.productId, d]));
 
+  logger.info(
+    { newDeals: deals.length, existingActive: existingDeals.length },
+    'processDeals: starting',
+  );
+
   // Track which products are still deals
   const currentDealProductIds = new Set(deals.map((d) => d.product.id));
 
@@ -32,7 +37,11 @@ export async function processDeals(
 
     if (!existing) {
       // NEW DEAL — never seen before
-      await handleNewDeal(deal);
+      try {
+        await handleNewDeal(deal);
+      } catch (err) {
+        logger.error({ productId: deal.product.id, error: (err as Error).message }, 'handleNewDeal failed');
+      }
     } else {
       // EXISTING DEAL — check if we should update
       await handleExistingDeal(deal, existing);
@@ -67,23 +76,33 @@ async function handleNewDeal(deal: Deal): Promise<void> {
     previousDeal.dealGoneAt &&
     (now - previousDeal.dealGoneAt) > config.dealGoneRenotifyHours * 60 * 60 * 1000;
 
-  // Insert/update active deal record
-  const dealRecord = await db.insert(activeDeals).values({
-    productId: deal.product.id,
-    platform: deal.product.platform,
-    firstDetectedAt: now,
-    lastNotifiedAt: now,
-    lastNotifiedPrice: deal.finalPrice,
-    lastNotifiedSavingsPct: deal.totalSavingsPct,
-    lastPromoHash: '',
-    currentPrice: deal.finalPrice,
-    currentSavingsPct: deal.totalSavingsPct,
-    marketValue: deal.marketValue,
-    status: 'active',
-    notificationCount: 1,
-  }).returning().get();
+  // Insert active deal record
+  let dealId: number;
+  try {
+    const result = db.insert(activeDeals).values({
+      productId: deal.product.id,
+      platform: deal.product.platform,
+      firstDetectedAt: now,
+      lastNotifiedAt: now,
+      lastNotifiedPrice: deal.finalPrice,
+      lastNotifiedSavingsPct: deal.totalSavingsPct,
+      lastPromoHash: '',
+      currentPrice: deal.finalPrice,
+      currentSavingsPct: deal.totalSavingsPct,
+      marketValue: deal.marketValue,
+      status: 'active',
+      notificationCount: 1,
+    }).returning().get();
 
-  if (!dealRecord) return;
+    if (!result) {
+      logger.error({ productId: deal.product.id }, 'handleNewDeal: insert returned null');
+      return;
+    }
+    dealId = result.id;
+  } catch (err) {
+    logger.error({ productId: deal.product.id, error: (err as Error).message }, 'handleNewDeal: DB insert failed');
+    return;
+  }
 
   // Generate affiliate link
   const affiliateUrl = deal.affiliateUrl || deal.product.url;
@@ -92,8 +111,10 @@ async function handleNewDeal(deal: Deal): Promise<void> {
   const status = isDealBack ? 'deal_back' : 'active';
   const text = formatDealMessage(deal, affiliateUrl, status);
 
+  logger.info({ productId: deal.product.id, dealId, textLen: text.length }, 'handleNewDeal: sending broadcast');
+
   // Send to all active subscribers
-  await broadcastToSubscribers(dealRecord.id, deal, text);
+  await broadcastToSubscribers(dealId, deal, text);
 
   logger.info(
     {
@@ -231,12 +252,24 @@ async function broadcastToSubscribers(
   const db = getDB();
   const subs = await getActiveSubscribers();
 
-  // Batch: send top 3 deals individually, rest as summary
+  logger.info({ dealId, subscribers: subs.length }, 'broadcastToSubscribers: starting');
+
+  if (subs.length === 0) {
+    logger.warn('broadcastToSubscribers: no active subscribers found!');
+    return;
+  }
+
   let sent = 0;
   for (const sub of subs) {
     // Check min savings preference
-    if (deal.totalSavings < sub.minSavingsRupees) continue;
-    if (sub.mode === 'digest') continue; // Skip for digest-only users
+    if (deal.totalSavings < sub.minSavingsRupees) {
+      logger.debug({ chatId: sub.chatId, minSavings: sub.minSavingsRupees, dealSavings: deal.totalSavings }, 'Skipped: below min savings');
+      continue;
+    }
+    if (sub.mode === 'digest') {
+      logger.debug({ chatId: sub.chatId }, 'Skipped: digest mode');
+      continue;
+    }
 
     const messageId = await sendMessage(sub.chatId, text);
     if (messageId) {
@@ -249,10 +282,12 @@ async function broadcastToSubscribers(
         createdAt: Date.now(),
       });
       sent++;
+    } else {
+      logger.error({ chatId: sub.chatId, dealId }, 'broadcastToSubscribers: sendMessage returned null');
     }
   }
 
-  logger.debug({ dealId, sent, total: subs.length }, 'Broadcast complete');
+  logger.info({ dealId, sent, total: subs.length }, 'Broadcast complete');
 }
 
 async function editBroadcast(dealId: number, text: string): Promise<void> {
