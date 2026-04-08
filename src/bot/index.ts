@@ -54,7 +54,7 @@ export function initBot(): Bot {
       await db.update(subscribers).set({ isActive: true }).where(eq(subscribers.chatId, chatId));
     }
 
-    await ctx.reply(
+    const welcomeText =
       '🟢 Welcome to Gold Arbitrage Deal Tracker!\n\n' +
       'I scan Myntra & Ajio for gold coins/bars priced below IBJA spot rate.\n\n' +
       'Commands:\n' +
@@ -62,8 +62,17 @@ export function initBot(): Bot {
       '/gold — Current IBJA gold rates\n' +
       '/settings — Notification preferences\n' +
       '/stop — Unsubscribe\n\n' +
-      'You\'ll receive instant alerts when deals are found!',
-    );
+      'You\'ll receive instant alerts when deals are found!';
+
+    if (activeDealsList.length > 0) {
+      const keyboard = new InlineKeyboard().text(
+        `🔥 View ${activeDealsList.length} Active Deal${activeDealsList.length > 1 ? 's' : ''}`,
+        'show_active_deals',
+      );
+      await ctx.reply(welcomeText, { reply_markup: keyboard });
+    } else {
+      await ctx.reply(welcomeText);
+    }
   });
 
   bot.command('stop', async (ctx) => {
@@ -108,6 +117,21 @@ export function initBot(): Bot {
   });
 
   bot.callbackQuery('deals_page_noop', async (ctx) => {
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('show_active_deals', async (ctx) => {
+    const page = 0;
+    const text = formatDealsSummary(activeDealsList, page);
+    const keyboard = buildDealsKeyboard(page, activeDealsList.length);
+    try {
+      await ctx.editMessageText(text, { reply_markup: keyboard ?? undefined });
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      if (!errMsg.includes('message is not modified')) {
+        logger.error({ error: errMsg }, 'Failed to show active deals');
+      }
+    }
     await ctx.answerCallbackQuery();
   });
 
