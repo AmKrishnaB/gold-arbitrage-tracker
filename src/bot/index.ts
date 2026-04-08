@@ -22,6 +22,14 @@ export function registerForceScan(callback: () => Promise<void>): void {
 export function initBot(): Bot {
   bot = new Bot(config.telegramBotToken);
 
+  // Disable link previews globally for all outgoing messages
+  bot.api.config.use((prev, method, payload, signal) => {
+    if ('link_preview_options' in payload || method === 'sendMessage' || method === 'editMessageText') {
+      (payload as any).link_preview_options = { is_disabled: true };
+    }
+    return prev(method, payload, signal);
+  });
+
   // ─── Commands ───
 
   bot.command('start', async (ctx) => {
@@ -248,7 +256,7 @@ export async function clearDealHistory(): Promise<void> {
  */
 export async function sendMessage(chatId: string, text: string): Promise<number | null> {
   try {
-    const msg = await bot.api.sendMessage(chatId, text, { parse_mode: undefined });
+    const msg = await bot.api.sendMessage(chatId, text, { parse_mode: undefined, link_preview_options: { is_disabled: true } });
     return msg.message_id;
   } catch (err) {
     logger.error({ chatId, error: (err as Error).message }, 'Failed to send message');
@@ -261,7 +269,7 @@ export async function sendMessage(chatId: string, text: string): Promise<number 
  */
 export async function editMessage(chatId: string, messageId: number, text: string): Promise<boolean> {
   try {
-    await bot.api.editMessageText(chatId, messageId, text);
+    await bot.api.editMessageText(chatId, messageId, text, { link_preview_options: { is_disabled: true } });
     return true;
   } catch (err) {
     const errMsg = (err as Error).message;
