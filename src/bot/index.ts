@@ -7,6 +7,7 @@ import { eq } from 'drizzle-orm';
 import { getCachedRates } from '../services/goldRate.js';
 import { formatGoldRateMessage, formatDealsSummary, DEALS_PAGE_SIZE } from './templates.js';
 import type { Deal } from '../config/types.js';
+import { approveDeal, rejectDeal } from '../services/notifier.js';
 
 let bot: Bot;
 let activeDealsList: Deal[] = [];
@@ -133,6 +134,65 @@ export function initBot(): Bot {
       }
     }
     await ctx.answerCallbackQuery();
+  });
+
+  // ─── Admin Approval: Approve / Reject ───
+
+  bot.callbackQuery(/^approve_deal:(\d+)$/, async (ctx) => {
+    if (ctx.chat?.id.toString() !== config.telegramAdminChatId) {
+      await ctx.answerCallbackQuery({ text: 'Only admin can approve deals.' });
+      return;
+    }
+
+    const dealId = parseInt(ctx.match![1]);
+    const result = await approveDeal(dealId);
+
+    if (result.success) {
+      try {
+        // Replace the approval message with confirmation (remove buttons)
+        const originalText = ctx.callbackQuery.message?.text ?? '';
+        const approvedText = originalText
+          .replace('⚠️ DEAL NEEDS APPROVAL', '✅ APPROVED & SENT')
+          .replace(/━+/, '━━━━━━━━━━━━━━━━━━━━━');
+        await ctx.editMessageText(approvedText);
+      } catch (err) {
+        const errMsg = (err as Error).message;
+        if (!errMsg.includes('message is not modified')) {
+          logger.error({ error: errMsg }, 'Failed to edit approval message');
+        }
+      }
+      await ctx.answerCallbackQuery({ text: '✅ Deal approved and sent to all subscribers!' });
+    } else {
+      await ctx.answerCallbackQuery({ text: `❌ ${result.reason}` });
+    }
+  });
+
+  bot.callbackQuery(/^reject_deal:(\d+)$/, async (ctx) => {
+    if (ctx.chat?.id.toString() !== config.telegramAdminChatId) {
+      await ctx.answerCallbackQuery({ text: 'Only admin can reject deals.' });
+      return;
+    }
+
+    const dealId = parseInt(ctx.match![1]);
+    const result = await rejectDeal(dealId);
+
+    if (result.success) {
+      try {
+        const originalText = ctx.callbackQuery.message?.text ?? '';
+        const rejectedText = originalText
+          .replace('⚠️ DEAL NEEDS APPROVAL', '❌ REJECTED')
+          .replace(/━+/, '━━━━━━━━━━━━━━━━━━━━━');
+        await ctx.editMessageText(rejectedText);
+      } catch (err) {
+        const errMsg = (err as Error).message;
+        if (!errMsg.includes('message is not modified')) {
+          logger.error({ error: errMsg }, 'Failed to edit rejection message');
+        }
+      }
+      await ctx.answerCallbackQuery({ text: '❌ Deal rejected — not sent to subscribers.' });
+    } else {
+      await ctx.answerCallbackQuery({ text: `❌ ${result.reason}` });
+    }
   });
 
   bot.command('settings', async (ctx) => {
@@ -284,6 +344,23 @@ export async function sendMessage(chatId: string, text: string): Promise<number 
     return msg.message_id;
   } catch (err) {
     logger.error({ chatId, error: (err as Error).message }, 'Failed to send message');
+    return null;
+  }
+}
+
+/**
+ * Send a message with an inline keyboard to a specific chat ID.
+ */
+export async function sendMessageWithKeyboard(chatId: string, text: string, keyboard: InlineKeyboard): Promise<number | null> {
+  try {
+    const msg = await bot.api.sendMessage(chatId, text, {
+      parse_mode: undefined,
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard,
+    });
+    return msg.message_id;
+  } catch (err) {
+    logger.error({ chatId, error: (err as Error).message }, 'Failed to send message with keyboard');
     return null;
   }
 }

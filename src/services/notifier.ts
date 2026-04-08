@@ -2,10 +2,37 @@ import { config } from '../config/index.js';
 import type { Deal, DealStatus, NormalizedProduct } from '../config/types.js';
 import { getDB } from '../db/index.js';
 import { activeDeals, sentMessages, subscribers } from '../db/schema.js';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, inArray } from 'drizzle-orm';
 import { formatDealMessage, formatExpiredMessage } from '../bot/templates.js';
-import { sendMessage, editMessage, getActiveSubscribers } from '../bot/index.js';
+import { sendMessage, editMessage, sendMessageWithKeyboard, getActiveSubscribers } from '../bot/index.js';
+import { InlineKeyboard } from 'grammy';
 import { logger } from '../utils/logger.js';
+
+// ─── Pending Approval Store ───
+// Maps dealId → Deal object so we can broadcast after admin approves
+const pendingApprovalDeals = new Map<number, Deal>();
+
+/**
+ * Get a pending deal by its DB id (for admin approval callback).
+ */
+export function getPendingDeal(dealId: number): Deal | undefined {
+  return pendingApprovalDeals.get(dealId);
+}
+
+/**
+ * Remove a deal from the pending map.
+ */
+export function removePendingDeal(dealId: number): void {
+  pendingApprovalDeals.delete(dealId);
+}
+
+/**
+ * Check if a deal needs admin approval.
+ * Deals with savings > adminApprovalThresholdPct below spot need approval.
+ */
+function needsAdminApproval(deal: Deal): boolean {
+  return deal.totalSavingsPct > config.adminApprovalThresholdPct;
+}
 
 /**
  * Process newly detected deals — decide whether to send new notification,
@@ -18,8 +45,10 @@ export async function processDeals(
   const db = getDB();
   const now = Date.now();
 
-  // Get all current active deals from DB
-  const existingDeals = await db.select().from(activeDeals).where(eq(activeDeals.status, 'active')).all();
+  // Get all current active/pending deals from DB
+  const existingDeals = await db.select().from(activeDeals)
+    .where(inArray(activeDeals.status, ['active', 'pending_approval']))
+    .all();
   const existingMap = new Map(existingDeals.map((d) => [d.productId, d]));
 
   logger.info(
@@ -42,8 +71,17 @@ export async function processDeals(
       } catch (err) {
         logger.error({ productId: deal.product.id, error: (err as Error).message }, 'handleNewDeal failed');
       }
+    } else if (existing.status === 'pending_approval') {
+      // Still pending — update price in DB but don't re-send to admin
+      await db.update(activeDeals).set({
+        currentPrice: deal.finalPrice,
+        currentSavingsPct: deal.totalSavingsPct,
+        marketValue: deal.marketValue,
+      }).where(eq(activeDeals.id, existing.id));
+      // Keep the pending deal object up-to-date
+      pendingApprovalDeals.set(existing.id, deal);
     } else {
-      // EXISTING DEAL — check if we should update
+      // EXISTING ACTIVE DEAL — check if we should update
       await handleExistingDeal(deal, existing);
     }
   }
@@ -51,8 +89,18 @@ export async function processDeals(
   // ─── Handle EXPIRED deals ───
   for (const existing of existingDeals) {
     if (!currentDealProductIds.has(existing.productId)) {
-      // Deal no longer valid
-      await handleExpiredDeal(existing, allProducts);
+      if (existing.status === 'pending_approval') {
+        // Was pending approval but deal is gone — just clean up
+        await db.update(activeDeals).set({
+          status: 'expired',
+          dealGoneAt: now,
+        }).where(eq(activeDeals.id, existing.id));
+        pendingApprovalDeals.delete(existing.id);
+        logger.info({ productId: existing.productId }, 'Pending deal expired before approval');
+      } else {
+        // Active deal no longer valid
+        await handleExpiredDeal(existing, allProducts);
+      }
     }
   }
 }
@@ -76,7 +124,10 @@ async function handleNewDeal(deal: Deal): Promise<void> {
     previousDeal.dealGoneAt &&
     (now - previousDeal.dealGoneAt) > config.dealGoneRenotifyHours * 60 * 60 * 1000;
 
-  // Insert active deal record
+  const requiresApproval = needsAdminApproval(deal);
+  const initialStatus = requiresApproval ? 'pending_approval' : 'active';
+
+  // Insert deal record
   let dealId: number;
   try {
     const result = db.insert(activeDeals).values({
@@ -90,8 +141,8 @@ async function handleNewDeal(deal: Deal): Promise<void> {
       currentPrice: deal.finalPrice,
       currentSavingsPct: deal.totalSavingsPct,
       marketValue: deal.marketValue,
-      status: 'active',
-      notificationCount: 1,
+      status: initialStatus,
+      notificationCount: requiresApproval ? 0 : 1,
     }).returning().get();
 
     if (!result) {
@@ -104,27 +155,114 @@ async function handleNewDeal(deal: Deal): Promise<void> {
     return;
   }
 
-  // Generate affiliate link
   const affiliateUrl = deal.affiliateUrl || deal.product.url;
-
-  // Format message
   const status = isDealBack ? 'deal_back' : 'active';
   const text = formatDealMessage(deal, affiliateUrl, status);
 
-  logger.info({ productId: deal.product.id, dealId, textLen: text.length }, 'handleNewDeal: sending broadcast');
+  if (requiresApproval) {
+    // Store deal for later broadcast after approval
+    pendingApprovalDeals.set(dealId, deal);
 
-  // Send to all active subscribers
+    // Send to admin with approve/reject buttons
+    await sendAdminApproval(dealId, deal, text);
+
+    logger.info(
+      {
+        productId: deal.product.id,
+        dealId,
+        savingsPct: deal.totalSavingsPct.toFixed(1),
+      },
+      'Deal sent to admin for approval (savings > threshold)',
+    );
+  } else {
+    // Normal flow — broadcast to all subscribers
+    logger.info({ productId: deal.product.id, dealId, textLen: text.length }, 'handleNewDeal: sending broadcast');
+    await broadcastToSubscribers(dealId, deal, text);
+
+    logger.info(
+      {
+        productId: deal.product.id,
+        savings: deal.totalSavings,
+        savingsPct: deal.totalSavingsPct.toFixed(1),
+        isDealBack,
+      },
+      'New deal notified',
+    );
+  }
+}
+
+/**
+ * Send deal to admin with Approve / Reject inline buttons.
+ */
+async function sendAdminApproval(dealId: number, deal: Deal, dealText: string): Promise<void> {
+  const adminChatId = config.telegramAdminChatId;
+  if (!adminChatId) {
+    logger.error('No admin chat ID configured — cannot request approval');
+    return;
+  }
+
+  const header =
+    `⚠️ DEAL NEEDS APPROVAL (${deal.totalSavingsPct.toFixed(1)}% below spot)\n` +
+    `━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  const keyboard = new InlineKeyboard()
+    .text('✅ Approve & Send', `approve_deal:${dealId}`)
+    .text('❌ Reject', `reject_deal:${dealId}`);
+
+  await sendMessageWithKeyboard(adminChatId, header + dealText, keyboard);
+}
+
+/**
+ * Called when admin approves a deal — broadcast to all subscribers.
+ */
+export async function approveDeal(dealId: number): Promise<{ success: boolean; reason?: string }> {
+  const db = getDB();
+  const deal = pendingApprovalDeals.get(dealId);
+
+  if (!deal) {
+    return { success: false, reason: 'Deal no longer in pending queue (expired or already handled)' };
+  }
+
+  // Update status to active
+  await db.update(activeDeals).set({
+    status: 'active',
+    lastNotifiedAt: Date.now(),
+    notificationCount: 1,
+  }).where(eq(activeDeals.id, dealId));
+
+  // Broadcast to subscribers
+  const affiliateUrl = deal.affiliateUrl || deal.product.url;
+  const text = formatDealMessage(deal, affiliateUrl, 'active');
   await broadcastToSubscribers(dealId, deal, text);
 
-  logger.info(
-    {
-      productId: deal.product.id,
-      savings: deal.totalSavings,
-      savingsPct: deal.totalSavingsPct.toFixed(1),
-      isDealBack,
-    },
-    'New deal notified',
-  );
+  // Clean up
+  pendingApprovalDeals.delete(dealId);
+
+  logger.info({ dealId, productId: deal.product.id }, 'Deal approved by admin and broadcast');
+  return { success: true };
+}
+
+/**
+ * Called when admin rejects a deal — mark as rejected, don't broadcast.
+ */
+export async function rejectDeal(dealId: number): Promise<{ success: boolean; reason?: string }> {
+  const db = getDB();
+  const deal = pendingApprovalDeals.get(dealId);
+
+  if (!deal) {
+    return { success: false, reason: 'Deal no longer in pending queue (expired or already handled)' };
+  }
+
+  // Mark as rejected in DB
+  await db.update(activeDeals).set({
+    status: 'rejected',
+  }).where(eq(activeDeals.id, dealId));
+
+  // Clean up
+  pendingApprovalDeals.delete(dealId);
+
+  logger.info({ dealId, productId: deal.product.id }, 'Deal rejected by admin');
+  return { success: true };
 }
 
 /**
@@ -261,6 +399,9 @@ async function broadcastToSubscribers(
 
   let sent = 0;
   for (const sub of subs) {
+    // Skip admin for broadcasts — admin already got the approval message
+    // (admin still gets deals that don't need approval, via normal flow)
+
     // Check min savings preference
     if (deal.totalSavings < sub.minSavingsRupees) {
       logger.debug({ chatId: sub.chatId, minSavings: sub.minSavingsRupees, dealSavings: deal.totalSavings }, 'Skipped: below min savings');
