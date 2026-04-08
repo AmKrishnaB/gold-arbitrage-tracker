@@ -10,6 +10,14 @@ import type { Deal } from '../config/types.js';
 
 let bot: Bot;
 let activeDealsList: Deal[] = [];
+let forceScanCallback: (() => Promise<void>) | null = null;
+
+/**
+ * Register the force scan callback (called from scheduler to avoid circular imports).
+ */
+export function registerForceScan(callback: () => Promise<void>): void {
+  forceScanCallback = callback;
+}
 
 export function initBot(): Bot {
   bot = new Bot(config.telegramBotToken);
@@ -164,13 +172,22 @@ export function initBot(): Bot {
   bot.command('force_scan', async (ctx) => {
     if (ctx.chat.id.toString() !== config.telegramAdminChatId) return;
     await ctx.reply('🔄 Force scan triggered. Results will follow...');
-    // The scheduler will pick this up via an event or direct call
+    if (forceScanCallback) {
+      forceScanCallback().catch((err) => {
+        logger.error({ error: (err as Error).message }, 'Force scan failed');
+      });
+    }
   });
 
   bot.command('force_resend', async (ctx) => {
     if (ctx.chat.id.toString() !== config.telegramAdminChatId) return;
     await clearDealHistory();
-    await ctx.reply('🗑️ Deal history cleared. All deals in the next scan will be sent as new notifications.');
+    await ctx.reply('🗑️ Deal history cleared. Running scan now — all deals will be sent as new notifications...');
+    if (forceScanCallback) {
+      forceScanCallback().catch((err) => {
+        logger.error({ error: (err as Error).message }, 'Force resend scan failed');
+      });
+    }
   });
 
   // Error handling

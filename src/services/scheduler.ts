@@ -6,7 +6,7 @@ import { fetchAllMyntraProducts } from '../scrapers/myntra.js';
 import { detectDeals } from './dealDetector.js';
 import { generateAffiliateLink } from './earnkaro.js';
 import { processDeals } from './notifier.js';
-import { updateActiveDeals } from '../bot/index.js';
+import { updateActiveDeals, registerForceScan } from '../bot/index.js';
 import { getDB } from '../db/index.js';
 import { products, scanLog, ibjaRateHistory } from '../db/schema.js';
 import { sql } from 'drizzle-orm';
@@ -193,6 +193,9 @@ async function refreshIBJARates(): Promise<void> {
  */
 export function startScheduler(): void {
   const intervalMin = config.scanIntervalMinutes;
+
+  // Register force scan callback so bot commands can trigger scans
+  registerForceScan(runScanCycle);
 
   // Product scan cycle — every N minutes
   cron.schedule(`*/${intervalMin} * * * *`, () => {
