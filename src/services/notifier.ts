@@ -5,7 +5,6 @@ import { activeDeals, sentMessages, subscribers } from '../db/schema.js';
 import { eq, and } from 'drizzle-orm';
 import { formatDealMessage, formatExpiredMessage } from '../bot/templates.js';
 import { sendMessage, editMessage, getActiveSubscribers } from '../bot/index.js';
-import { generateAffiliateLink } from './earnkaro.js';
 import { generatePromoHash } from './dealDetector.js';
 import { logger } from '../utils/logger.js';
 import type { PlatformOffers } from '../config/types.js';
@@ -91,7 +90,7 @@ async function handleNewDeal(deal: Deal, promoHash: string): Promise<void> {
   if (!dealRecord) return;
 
   // Generate affiliate link
-  const affiliateUrl = await generateAffiliateLink(deal.product.url);
+  const affiliateUrl = deal.affiliateUrl || deal.product.url;
 
   // Format message
   const status = isDealBack ? 'deal_back' : 'active';
@@ -141,7 +140,7 @@ async function handleExistingDeal(
 
   if (priceDrop && cooldownPassed) {
     // Price dropped — edit existing message
-    const affiliateUrl = await generateAffiliateLink(deal.product.url);
+    const affiliateUrl = deal.affiliateUrl || deal.product.url;
     const text = formatDealMessage(deal, affiliateUrl, 'price_drop');
     await editBroadcast(existing.id, text);
 
@@ -155,7 +154,7 @@ async function handleExistingDeal(
     logger.info({ productId: existing.productId, priceDrop: true, savingsChange: savingsChange.toFixed(1) }, 'Deal updated (price drop)');
   } else if (promoChanged && cooldownPassed) {
     // New promo/bank offer
-    const affiliateUrl = await generateAffiliateLink(deal.product.url);
+    const affiliateUrl = deal.affiliateUrl || deal.product.url;
     const text = formatDealMessage(deal, affiliateUrl, 'better_offer');
     await editBroadcast(existing.id, text);
 
@@ -168,7 +167,7 @@ async function handleExistingDeal(
     logger.info({ productId: existing.productId, promoChanged: true }, 'Deal updated (better offer)');
   } else if (savingsChange >= config.silentEditThresholdPct && cooldownPassed) {
     // Market moved enough for silent edit
-    const affiliateUrl = await generateAffiliateLink(deal.product.url);
+    const affiliateUrl = deal.affiliateUrl || deal.product.url;
     const text = formatDealMessage(deal, affiliateUrl, 'active');
     await editBroadcast(existing.id, text);
 

@@ -209,6 +209,7 @@ export interface Deal {
   ibjaRate: number;            // Per-gram IBJA rate used
   ibjaSession: 'AM' | 'PM';
   detectedAt: number;
+  affiliateUrl?: string;       // EarnKaro affiliate link (generated after detection)
 }
 
 export interface BankOfferResult {

@@ -147,7 +147,7 @@ export function formatDealsSummary(deals: Deal[]): string {
     lines.push(
       `   ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
     );
-    lines.push(`   ${deal.product.url}`);
+    lines.push(`   ${deal.affiliateUrl || deal.product.url}`);
     lines.push('');
   }
 

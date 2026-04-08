@@ -5,6 +5,7 @@ import { fetchAllAjioProducts } from '../scrapers/ajio.js';
 import { fetchAllMyntraProducts } from '../scrapers/myntra.js';
 import { fetchAjioOffers } from '../scrapers/ajio.js';
 import { detectDeals } from './dealDetector.js';
+import { generateAffiliateLink } from './earnkaro.js';
 import { processDeals } from './notifier.js';
 import { updateActiveDeals } from '../bot/index.js';
 import { getDB } from '../db/index.js';
@@ -68,10 +69,18 @@ export async function runScanCycle(): Promise<void> {
     // 4. Detect deals
     const deals = detectDeals(allProducts, rates, cachedOffers ?? undefined);
 
-    // Update the bot's active deals list (for /deals command)
+    // 5. Generate affiliate links for all deals
+    if (deals.length > 0) {
+      logger.info({ count: deals.length }, 'Generating affiliate links...');
+      for (const deal of deals) {
+        deal.affiliateUrl = await generateAffiliateLink(deal.product.url);
+      }
+    }
+
+    // Update the bot's active deals list (for /deals command — now with affiliate URLs)
     updateActiveDeals(deals);
 
-    // 5. Process notifications
+    // 6. Process notifications
     if (deals.length > 0) {
       await processDeals(deals, allProducts, cachedOffers ?? undefined);
     }
