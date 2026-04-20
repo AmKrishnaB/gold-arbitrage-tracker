@@ -20,15 +20,23 @@ const CANDIDATE_THRESHOLD = 1.10;
 
 /**
  * Detect deals using 2-phase approach:
- * Phase 1: Pre-filter — find candidates whose listing price is within 5% above IBJA spot
- * Phase 2: PDP verify — fetch real per-product offers from Ajio PDP, recalculate with actual promos & bank offers
+ * Phase 1: Pre-filter — find candidates whose listing price is within CANDIDATE_THRESHOLD
+ *          above IBJA spot. PDP is only fetched for these, NOT for all ~hundreds of products.
+ * Phase 2: PDP verify — fetch real per-product offers from Ajio PDP, recalculate with
+ *          actual promos & bank offers.
  *
- * For Myntra products (no PDP offers), deal detection uses listing price only.
+ * NO STATIC FALLBACK for Ajio: if the PDP fetch fails for a candidate we SKIP that product
+ * entirely (logged as a warning). Per user requirement: strict accuracy over coverage.
+ * The platform-wide `offers` parameter (fetched via sentinel-cart) is retained for
+ * observability/logging only and is NOT used to synthesize deals.
+ *
+ * For Myntra products (no PDP offers scraped), deal detection uses listing price only.
  */
 export async function detectDeals(
   products: NormalizedProduct[],
   rates: GoldRates,
-  offers?: PlatformOffers,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _platformOffers?: PlatformOffers,
 ): Promise<Deal[]> {
   const deals: Deal[] = [];
 
@@ -53,7 +61,7 @@ export async function detectDeals(
     const pricePerGram = product.effectivePrice / product.totalWeightGrams;
     if (pricePerGram > ibjaRate * 1.5) continue;
 
-    // Candidate if listing price is within threshold (5% above spot)
+    // Candidate if listing price is within threshold
     if (product.effectivePrice <= marketValue * CANDIDATE_THRESHOLD) {
       ajioCandidates.push(product);
     }
@@ -65,21 +73,40 @@ export async function detectDeals(
   );
 
   // ─── Phase 2: Fetch PDP for Ajio candidates ───
+  // Cache per-product offers in a Map for the duration of this scan so we never
+  // hit the same PDP twice. Concurrency=5 with inter-batch delay is enforced
+  // inside fetchProductPDPs (see src/scrapers/ajio.ts).
   let pdpOffers = new Map<string, ProductOffers>();
   if (ajioCandidates.length > 0) {
     pdpOffers = await fetchProductPDPs(ajioCandidates, 5);
   }
 
-  // Evaluate Ajio candidates with real PDP offers
+  let ajioSkippedNoPDP = 0;
   for (const product of ajioCandidates) {
     const productPDP = pdpOffers.get(product.id);
-    const deal = evaluateProduct(product, rates, productPDP);
+    if (!productPDP) {
+      // STRICT: no static fallback — skip this product with a warning.
+      ajioSkippedNoPDP += 1;
+      logger.warn(
+        { productId: product.id, url: product.url },
+        'Ajio candidate skipped: PDP offer fetch failed (no static fallback)',
+      );
+      continue;
+    }
+    const deal = evaluateAjioProduct(product, rates, productPDP);
     if (deal) deals.push(deal);
   }
 
-  // Evaluate Myntra products (no PDP/offers)
+  if (ajioSkippedNoPDP > 0) {
+    logger.warn(
+      { skipped: ajioSkippedNoPDP, total: ajioCandidates.length },
+      'Ajio candidates skipped due to PDP fetch failure',
+    );
+  }
+
+  // Evaluate Myntra products (listing-only, no PDP/offers)
   for (const product of myntraProducts) {
-    const deal = evaluateProduct(product, rates);
+    const deal = evaluateMyntraProduct(product, rates);
     if (deal) deals.push(deal);
   }
 
@@ -92,60 +119,73 @@ export async function detectDeals(
 }
 
 /**
- * Evaluate a single product for deal potential.
- * For Ajio: uses real per-product PDP offers (promos + bank offers).
- * For Myntra: uses listing price only.
+ * Ajio deal evaluation using real PDP offers.
+ *
+ * Pricing model:
+ *   listedPrice   = product.listedPrice (pre-cart-promo listed price; Ajio raw.price.value)
+ *   promoDiscount = max(product.promoDiscount ?? 0, PDP-promo savings against listedPrice)
+ *   bankDiscount  = best applicable PDP bank offer against listedPrice
+ *
+ * Stacking: promo and bank offers generally do NOT stack on Ajio. We apply the
+ * BETTER of the two (max) unless a PDP offer description explicitly opts in
+ * (see shouldStack). Default behaviour: no stacking.
+ *
+ *   finalPrice = listedPrice - (stack ? promo + bank : max(promo, bank))
  */
-function evaluateProduct(
+function evaluateAjioProduct(
   product: NormalizedProduct,
   rates: GoldRates,
-  productOffers?: ProductOffers | null,
+  productOffers: ProductOffers,
 ): Deal | null {
-  // Get IBJA rate for this product's fineness
   const ibjaRate = getRate(rates, product.fineness);
   if (ibjaRate <= 0) return null;
 
-  // Market value = weight × IBJA per-gram rate
   const marketValue = product.totalWeightGrams * ibjaRate;
   if (marketValue <= 0) return null;
 
-  // Base effective price (already the lowest of mrp/selling/offer/coupon)
-  let finalPrice = product.effectivePrice;
-  let promoSavings = 0;
-  let appliedPromoCode: string | undefined;
-  let bankOfferSavings = 0;
-  let bestBankOffer: AjioBankOffer | undefined;
-  let topBankOffers: BankOfferResult[] = [];
+  const listedPrice = product.listedPrice ?? product.effectivePrice;
 
-  // Apply real PDP offers for Ajio products
-  if (product.platform === 'ajio' && productOffers) {
-    // Promo code savings (from real PDP)
-    const promoResult = calculatePromoSavings(finalPrice, productOffers.promos);
-    promoSavings = promoResult.savings;
-    appliedPromoCode = promoResult.promoCode;
+  // Promo: start from listing-derived discount, upgrade if PDP reveals a bigger promo.
+  const listingPromo = product.promoDiscount ?? 0;
+  const pdpPromo = calculatePromoSavings(listedPrice, productOffers.promos);
+  let promoDiscount = Math.max(listingPromo, pdpPromo.savings);
+  const appliedPromoCode = pdpPromo.savings >= listingPromo ? pdpPromo.promoCode : undefined;
 
-    // Bank offer savings (calculated on original price, not after promo)
-    const bankResult = calculateTopBankOffers(product.effectivePrice, productOffers.bankOffers);
-    topBankOffers = bankResult;
-    if (bankResult.length > 0) {
-      bestBankOffer = bankResult[0].offer;
-      bankOfferSavings = bankResult[0].savings;
+  // Bank: best PDP bank offer evaluated against listedPrice (the true pre-discount price).
+  const topBankOffers = calculateTopBankOffers(listedPrice, productOffers.bankOffers);
+  const bestBankOffer = topBankOffers[0]?.offer;
+  let bankDiscount = topBankOffers[0]?.savings ?? 0;
+
+  // Stacking decision: only stack when an explicit signal says so.
+  const stack = shouldStack(productOffers);
+  const offerDiscount = stack
+    ? promoDiscount + bankDiscount
+    : Math.max(promoDiscount, bankDiscount);
+
+  // When not stacking we still report BOTH values for transparency, but also zero
+  // out the one that didn't "win" so the template math is unambiguous.
+  if (!stack) {
+    if (bankDiscount >= promoDiscount) {
+      promoDiscount = 0;
+    } else {
+      bankDiscount = 0;
     }
-
-    // Final price after all offers (use best bank offer only)
-    finalPrice = product.effectivePrice - promoSavings - bankOfferSavings;
   }
 
-  // Total savings
+  const finalPrice = Math.max(0, listedPrice - offerDiscount);
+
+  // Total savings vs spot market value
   const totalSavings = marketValue - finalPrice;
   const totalSavingsPct = (totalSavings / marketValue) * 100;
 
-  // Base savings (without promo/bank)
-  const savings = marketValue - product.effectivePrice;
+  // Base savings = listing-price-vs-spot (pre-offer)
+  const savings = marketValue - listedPrice;
   const savingsPct = (savings / marketValue) * 100;
 
-  // Is this a deal? Final price must be below market value
   if (totalSavings <= 0) return null;
+
+  // Persist the bank discount back onto the product for downstream DB write.
+  product.bankDiscount = bankDiscount;
 
   return {
     product,
@@ -153,11 +193,15 @@ function evaluateProduct(
     effectivePrice: product.effectivePrice,
     savings,
     savingsPct,
-    promoSavings,
+    // Legacy fields mirror the new three-field values (kept for message-format back-compat).
+    promoSavings: promoDiscount,
     appliedPromoCode,
     bestBankOffer,
-    bankOfferSavings,
+    bankOfferSavings: bankDiscount,
     topBankOffers,
+    listedPrice,
+    promoDiscount,
+    bankDiscount,
     finalPrice,
     totalSavings,
     totalSavingsPct,
@@ -168,10 +212,71 @@ function evaluateProduct(
 }
 
 /**
+ * Myntra deal evaluation using listing price only.
+ * No PDP scrape today — see src/scrapers/myntra.ts TODO.
+ */
+function evaluateMyntraProduct(product: NormalizedProduct, rates: GoldRates): Deal | null {
+  const ibjaRate = getRate(rates, product.fineness);
+  if (ibjaRate <= 0) return null;
+
+  const marketValue = product.totalWeightGrams * ibjaRate;
+  if (marketValue <= 0) return null;
+
+  const listedPrice = product.listedPrice ?? product.sellingPrice;
+  const promoDiscount = product.promoDiscount ?? 0;
+  const bankDiscount = 0;
+
+  const finalPrice = Math.max(0, listedPrice - Math.max(promoDiscount, bankDiscount));
+
+  const totalSavings = marketValue - finalPrice;
+  const totalSavingsPct = (totalSavings / marketValue) * 100;
+  const savings = marketValue - listedPrice;
+  const savingsPct = (savings / marketValue) * 100;
+
+  if (totalSavings <= 0) return null;
+
+  return {
+    product,
+    marketValue,
+    effectivePrice: product.effectivePrice,
+    savings,
+    savingsPct,
+    promoSavings: promoDiscount,
+    appliedPromoCode: undefined,
+    bestBankOffer: undefined,
+    bankOfferSavings: bankDiscount,
+    topBankOffers: [],
+    listedPrice,
+    promoDiscount,
+    bankDiscount,
+    finalPrice,
+    totalSavings,
+    totalSavingsPct,
+    ibjaRate,
+    ibjaSession: rates.session,
+    detectedAt: Date.now(),
+  };
+}
+
+/**
+ * Decide whether to stack promo + bank for this product.
+ * Ajio's default is that cart-level promos and bank offers do NOT stack on
+ * already-discounted coin/bar items. Only stack when a PDP offer description
+ * explicitly opts in ("on already discounted" / "stackable" wording).
+ */
+function shouldStack(offers: ProductOffers): boolean {
+  const haystacks = [
+    ...offers.promos.map((p) => p.description ?? ''),
+    ...offers.bankOffers.map((b) => b.description ?? ''),
+  ];
+  const re = /(stackab(le|ility)|on already[- ]discounted|stacks? on|in addition to (coupon|promo))/i;
+  return haystacks.some((h) => re.test(h));
+}
+
+/**
  * Get per-gram IBJA rate for a fineness value.
  */
 function getRate(rates: GoldRates, fineness: Fineness): number {
-  // Map fineness to rate key
   const keyMap: Record<number, keyof GoldRates['perGram']> = {
     999.9: 999,
     999: 999,
@@ -180,15 +285,12 @@ function getRate(rates: GoldRates, fineness: Fineness): number {
     750: 750,
     585: 585,
   };
-
   const key = keyMap[fineness];
   return key ? rates.perGram[key] : 0;
 }
 
 /**
- * Calculate savings from promo codes.
- * Takes the best applicable promo.
- * Returns savings amount and the promo code that achieved it.
+ * Calculate savings from PDP promo codes. Returns the best applicable promo.
  */
 function calculatePromoSavings(
   price: number,
@@ -200,7 +302,6 @@ function calculatePromoSavings(
   for (const promo of promos) {
     if (promo.restrictedToNewUser) continue;
 
-    // Parse the promo description to extract discount details
     const pctMatch = promo.description.match(/(\d+)%\s*off/i);
     const maxMatch = promo.description.match(/upto\s*Rs\.?\s*([\d,]+)/i);
     const minMatch = promo.description.match(/(?:cart value|minimum|min).*?Rs\.?\s*([\d,]+)/i);
@@ -213,7 +314,7 @@ function calculatePromoSavings(
 
     if (price < minOrder) continue;
 
-    const discount = Math.min(price * pct / 100, maxCap);
+    const discount = Math.min((price * pct) / 100, maxCap);
     if (discount > bestSavings) {
       bestSavings = discount;
       bestCode = promo.code;
@@ -239,40 +340,30 @@ function calculateTopBankOffers(
   const results: BankOfferResult[] = [];
 
   for (const offer of bankOffers) {
-    // Skip gold-excluded offers
     if (offer.excludesGold) continue;
-
-    // Skip offers pending admin review (conservative)
     if (offer.needsReview) continue;
-
-    // Skip if price below threshold
     if (price < offer.thresholdAmount) continue;
 
     let savings: number;
-
     switch (offer.parsedType) {
       case 'flat':
         savings = offer.parsedCap ?? offer.offerAmount;
         break;
-
       case 'cashback_cap':
         savings = offer.parsedCap ?? offer.offerAmount;
         break;
-
       case 'percent': {
         const pct = offer.parsedPct ?? offer.offerAmount;
-        const cap = offer.parsedCap ?? 1500; // Safe default if no cap found
-        savings = Math.min(price * pct / 100, cap);
+        const cap = offer.parsedCap ?? 1500;
+        savings = Math.min((price * pct) / 100, cap);
         break;
       }
-
       default:
-        // Unknown type — treat offerAmount as flat cap (conservative)
         savings = Math.min(offer.offerAmount, 500);
         break;
     }
 
-    // Sanity: savings should never exceed 25% of price
+    // Sanity: a single offer should never exceed 25% of price.
     savings = Math.min(savings, price * 0.25);
 
     if (savings > 0) {
@@ -280,10 +371,9 @@ function calculateTopBankOffers(
     }
   }
 
-  // Sort by savings descending
   results.sort((a, b) => b.savings - a.savings);
 
-  // Deduplicate by bankName (keep highest savings per bank)
+  // Deduplicate by bankName (keep highest savings per bank).
   const seenBanks = new Set<string>();
   const deduped: BankOfferResult[] = [];
   for (const r of results) {
