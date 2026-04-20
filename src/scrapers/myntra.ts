@@ -395,6 +395,17 @@ function normalizeMyntraProduct(raw: RawMyntraProduct): NormalizedProduct | null
     effectivePrice,
     discountPercent,
 
+    // Three-field pricing breakdown.
+    // Myntra only exposes the post-coupon price via couponData.text parsing, so we
+    // treat sellingPrice as the pre-promo listedPrice and derive promoDiscount
+    // from the coupon delta.
+    // TODO(bankDiscount): Myntra bank offers come from a separate PDP endpoint
+    //   (offers aggregator) that we don't currently scrape. Until that is wired up
+    //   the Myntra code path keeps its previous (no bank offer) behaviour — any
+    //   hardcoded bank-offer fallback is explicitly disabled for Ajio only.
+    listedPrice: sellingPrice,
+    promoDiscount: couponPrice != null ? Math.max(0, sellingPrice - couponPrice) : 0,
+
     weightSource: parsed.weightSource,
     puritySource: parsed.puritySource,
     parseWarnings: [...parsed.parseWarnings, ...extraWarnings],
