@@ -238,10 +238,28 @@ function normalizeAjioProduct(raw: RawAjioProduct): NormalizedProduct | null {
   if (parsed.totalWeightGrams <= 0) return null;
 
   // Price extraction
+  // Ajio has three price tiers in its listing API:
+  //   wasPriceData.value  -> MRP (struck-through on the card).
+  //   price.value         -> "listed" price the user actually sees as the main price
+  //                          BEFORE any cart-level promo is applied.
+  //   offerPrice.value    -> post-promo price (cart/coupon applied).
+  //
+  // Previously we stored offerPrice as the "listed" price, which conflated the
+  // post-promo value with the pre-promo one. The three-field breakdown below
+  // exposes listedPrice, promoDiscount, and (later in dealDetector) bankDiscount
+  // as distinct values — see src/config/types.ts for the contract.
   const mrp = raw.wasPriceData?.value ?? raw.price.value;
-  const sellingPrice = raw.price.value;
-  const offerPrice = raw.offerPrice?.value;
-  const effectivePrice = offerPrice ?? sellingPrice;
+  const sellingPrice = raw.price.value;             // kept for DB back-compat
+  const offerPrice = raw.offerPrice?.value;         // post-promo, if any
+
+  const listedPrice = sellingPrice;
+  const postPromoPrice = offerPrice ?? listedPrice;
+  const promoDiscount = Math.max(0, listedPrice - postPromoPrice);
+
+  // effectivePrice stays as the post-promo price to preserve existing shortlist-
+  // filter semantics (candidate near spot). The dealDetector now computes the
+  // true final price as listedPrice - max(promoDiscount, bankDiscount).
+  const effectivePrice = postPromoPrice;
 
   // Discount
   const discountMatch = raw.discountPercent?.match(/(\d+)/);
@@ -274,6 +292,10 @@ function normalizeAjioProduct(raw: RawAjioProduct): NormalizedProduct | null {
     offerPrice,
     effectivePrice,
     discountPercent,
+
+    // Three-field breakdown (bankDiscount is filled in by dealDetector from PDP).
+    listedPrice,
+    promoDiscount,
 
     weightSource: parsed.weightSource,
     puritySource: parsed.puritySource,

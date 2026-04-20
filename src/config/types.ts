@@ -131,12 +131,27 @@ export interface NormalizedProduct {
   // Pricing
   mrp: number;
   sellingPrice: number;
-  offerPrice?: number;      // Ajio 3rd tier
+  offerPrice?: number;      // Ajio 3rd tier (post-promo price)
   couponPrice?: number;     // Myntra coupon-applied price
   discountPercent: number;
 
-  // Effective = lowest available price
+  // Effective = lowest available price (post-listing-promo, pre-bank-offer).
+  // Kept for back-compat with shortlist filtering and downstream reads.
   effectivePrice: number;
+
+  // ─── Three-field pricing breakdown (Ajio) ───
+  // Distinct values per product so downstream code can show/stack them correctly.
+  // Myntra populates listedPrice + promoDiscount where possible; bankDiscount is Ajio-only
+  // (Myntra PDP bank offers are not currently scraped — see myntra.ts TODO).
+  //
+  // listedPrice   — pre-cart-promo listed price the user sees as the main price
+  //                 (Ajio: raw.price.value; NOT MRP which is the struck-through wasPrice).
+  // promoDiscount — listedPrice - offerPrice. Cart-level promo savings from listing.
+  // bankDiscount  — populated later by dealDetector from PDP-scraped bank offers.
+  //                 MUST NOT come from a static/hardcoded table (user-mandated).
+  listedPrice?: number;
+  promoDiscount?: number;
+  bankDiscount?: number;
 
   // Parse metadata
   weightSource: WeightSource;
@@ -213,7 +228,15 @@ export interface Deal {
   bankOfferSavings: number;
   topBankOffers: BankOfferResult[];   // Top 3 applicable offers with calculated savings
 
-  // Final price after all offers
+  // ─── Three-field breakdown (primarily Ajio) ───
+  // listedPrice = pre-cart-promo listed price (what the user sees on the listing card).
+  // promoDiscount = savings from cart-level promo (max of listing-derived and PDP-derived).
+  // bankDiscount = savings from the best applicable bank offer (from PDP; 0 if none).
+  listedPrice: number;
+  promoDiscount: number;
+  bankDiscount: number;
+
+  // Final price after applying the BETTER of promoDiscount / bankDiscount (non-stacking by default).
   finalPrice: number;
   totalSavings: number;
   totalSavingsPct: number;

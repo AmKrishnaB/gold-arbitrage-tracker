@@ -48,30 +48,38 @@ export function formatDealMessage(
   // ─── Price Breakdown ───
 
   // Listed price (the price on the product page)
-  lines.push(`💰 Listed Price: ${fmtRs(product.effectivePrice)}`);
+  lines.push(`💰 Listed Price: ${fmtRs(deal.listedPrice)}`);
 
   // Show MRP strikethrough if different
-  if (product.mrp > product.effectivePrice) {
+  if (product.mrp > deal.listedPrice) {
     lines.push(`   (MRP ${fmtRs(product.mrp)}, ${product.discountPercent}% OFF)`);
   }
 
-  // Promo discount
-  if (deal.promoSavings > 0) {
+  // Promo discount (cart-level; non-stacking by default so this may be 0 if bank won)
+  if (deal.promoDiscount > 0) {
     const promoLabel = deal.appliedPromoCode ? ` (${deal.appliedPromoCode})` : '';
-    lines.push(`🎫 Promo${promoLabel}: -${fmtRs(deal.promoSavings)}`);
+    lines.push(`🎫 Promo${promoLabel}: -${fmtRs(deal.promoDiscount)}`);
   }
 
   // Best prepaid/bank offer (top 1) — full description
-  if (deal.topBankOffers.length > 0) {
+  if (deal.bankDiscount > 0 && deal.topBankOffers.length > 0) {
     const top = deal.topBankOffers[0];
-    lines.push(`🏦 ${top.offer.bankName}: -${fmtRs(top.savings)}`);
+    lines.push(`🏦 ${top.offer.bankName}: -${fmtRs(deal.bankDiscount)}`);
     lines.push(`   ${top.offer.description}`);
   }
 
-  // Final price after all discounts
-  if (deal.finalPrice < product.effectivePrice) {
+  // Final price after applying the better of promo / bank (non-stacking).
+  if (deal.finalPrice < deal.listedPrice) {
     lines.push(`💵 Final Price: ${fmtRs(deal.finalPrice)}`);
   }
+
+  // Compact breakdown: 'Listed: ₹X | Promo: -₹Y | Bank: -₹Z | Final: ₹F vs Spot: ₹S'
+  lines.push(
+    `📋 Listed: ${fmtRs(deal.listedPrice)} | ` +
+      `Promo: -${fmtRs(deal.promoDiscount)} | ` +
+      `Bank: -${fmtRs(deal.bankDiscount)} | ` +
+      `Final: ${fmtRs(deal.finalPrice)} vs Spot: ${fmtRs(marketValue)}`,
+  );
 
   lines.push('');
 
@@ -184,9 +192,9 @@ export function formatDealsSummary(deals: Deal[], page = 0): string {
     );
 
     // Show listed price and final price
-    if (deal.finalPrice < deal.effectivePrice) {
+    if (deal.finalPrice < deal.listedPrice) {
       lines.push(
-        `   ${fmtRs(deal.effectivePrice)} → ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
+        `   ${fmtRs(deal.listedPrice)} → ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
       );
     } else {
       lines.push(
@@ -195,8 +203,8 @@ export function formatDealsSummary(deals: Deal[], page = 0): string {
     }
 
     // Promo coupon code
-    if (deal.promoSavings > 0 && deal.appliedPromoCode) {
-      lines.push(`   🎫 Use code: ${deal.appliedPromoCode} (-${fmtRs(deal.promoSavings)})`);
+    if (deal.promoDiscount > 0 && deal.appliedPromoCode) {
+      lines.push(`   🎫 Use code: ${deal.appliedPromoCode} (-${fmtRs(deal.promoDiscount)})`);
     }
 
     // Top 1 bank offer — full description

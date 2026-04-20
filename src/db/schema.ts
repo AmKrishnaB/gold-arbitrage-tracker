@@ -24,6 +24,13 @@ export const products = sqliteTable('products', {
   effectivePrice: real('effective_price').notNull(),
   discountPercent: real('discount_percent').notNull().default(0),
 
+  // Three-field pricing breakdown (nullable for back-compat with pre-migration rows;
+  // Ajio always populates listed_price + promo_discount; bank_discount set by dealDetector
+  // when PDP offers are fetched. Myntra populates listed_price + promo_discount only).
+  listedPrice: real('listed_price'),
+  promoDiscount: real('promo_discount'),
+  bankDiscount: real('bank_discount'),
+
   // Parse metadata
   weightSource: text('weight_source').notNull(),
   puritySource: text('purity_source').notNull(),

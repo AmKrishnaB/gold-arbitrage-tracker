@@ -39,6 +39,9 @@ export function initDB(): typeof db {
       coupon_price REAL,
       effective_price REAL NOT NULL,
       discount_percent REAL NOT NULL DEFAULT 0,
+      listed_price REAL,
+      promo_discount REAL,
+      bank_discount REAL,
       weight_source TEXT NOT NULL,
       purity_source TEXT NOT NULL,
       parse_warnings TEXT,
@@ -144,8 +147,28 @@ export function initDB(): typeof db {
     CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_id);
   `);
 
+  // Lightweight in-place migrations for columns added after a DB was first created.
+  // Kept here (instead of only in drizzle/) so existing sqlite files pick up new fields
+  // without requiring an out-of-band `drizzle-kit migrate` step.
+  ensureColumn(sqlite, 'products', 'listed_price', 'REAL');
+  ensureColumn(sqlite, 'products', 'promo_discount', 'REAL');
+  ensureColumn(sqlite, 'products', 'bank_discount', 'REAL');
+
   logger.info({ dbPath: config.dbPath }, 'Database initialized');
   return db;
+}
+
+function ensureColumn(
+  sqlite: Database.Database,
+  table: string,
+  column: string,
+  type: string,
+): void {
+  const info = sqlite.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!info.some((c) => c.name === column)) {
+    sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    logger.info({ table, column, type }, 'Added missing column via runtime migration');
+  }
 }
 
 export function getDB() {
