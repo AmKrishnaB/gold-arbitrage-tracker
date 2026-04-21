@@ -119,21 +119,25 @@ function evaluateProduct(
 
   // Apply real PDP offers for Ajio products
   if (product.platform === 'ajio' && productOffers) {
-    // Promo code savings (from real PDP)
-    const promoResult = calculatePromoSavings(finalPrice, productOffers.promos);
+    // Use sellingPrice as base — offerPrice already has promo baked in from listing API,
+    // so we calculate promo savings from sellingPrice to avoid double-counting
+    const basePrice = product.sellingPrice;
+
+    // Promo code savings (from real PDP, applied to sellingPrice)
+    const promoResult = calculatePromoSavings(basePrice, productOffers.promos);
     promoSavings = promoResult.savings;
     appliedPromoCode = promoResult.promoCode;
 
-    // Bank offer savings (calculated on original price, not after promo)
-    const bankResult = calculateTopBankOffers(product.effectivePrice, productOffers.bankOffers);
+    // Bank offer savings (calculated on sellingPrice)
+    const bankResult = calculateTopBankOffers(basePrice, productOffers.bankOffers);
     topBankOffers = bankResult;
     if (bankResult.length > 0) {
       bestBankOffer = bankResult[0].offer;
       bankOfferSavings = bankResult[0].savings;
     }
 
-    // Final price after all offers (use best bank offer only)
-    finalPrice = product.effectivePrice - promoSavings - bankOfferSavings;
+    // Final price = sellingPrice - promo - best bank offer
+    finalPrice = basePrice - promoSavings - bankOfferSavings;
   }
 
   // Total savings

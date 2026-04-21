@@ -47,12 +47,12 @@ export function formatDealMessage(
 
   // ─── Price Breakdown ───
 
-  // Listed price (the price on the product page)
-  lines.push(`💰 Listed Price: ${fmtRs(product.effectivePrice)}`);
+  // Listed price (the selling price on the product page, before promo codes)
+  lines.push(`💰 Listed Price: ${fmtRs(product.sellingPrice)}`);
 
   // Show MRP strikethrough if different
-  if (product.mrp > product.effectivePrice) {
-    lines.push(`   (MRP ${fmtRs(product.mrp)}, ${product.discountPercent}% OFF)`);
+  if (product.mrp > product.sellingPrice) {
+    lines.push(`   (MRP ${fmtRs(product.mrp)}, ${Math.round((1 - product.sellingPrice / product.mrp) * 100)}% OFF)`);
   }
 
   // Promo discount
@@ -184,9 +184,9 @@ export function formatDealsSummary(deals: Deal[], page = 0): string {
     );
 
     // Show listed price and final price
-    if (deal.finalPrice < deal.effectivePrice) {
+    if (deal.finalPrice < deal.product.sellingPrice) {
       lines.push(
-        `   ${fmtRs(deal.effectivePrice)} → ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
+        `   ${fmtRs(deal.product.sellingPrice)} → ${fmtRs(deal.finalPrice)} (Save ${fmtRs(deal.totalSavings)}, ${deal.totalSavingsPct.toFixed(1)}%)`,
       );
     } else {
       lines.push(
