@@ -265,14 +265,14 @@ function calculateTopBankOffers(
 
       case 'percent': {
         const pct = offer.parsedPct ?? offer.offerAmount;
-        const cap = offer.parsedCap ?? 1500; // Safe default if no cap found
+        const cap = offer.parsedCap ?? offer.offerAmount;
         savings = Math.min(price * pct / 100, cap);
         break;
       }
 
       default:
-        // Unknown type — treat offerAmount as flat cap (conservative)
-        savings = Math.min(offer.offerAmount, 500);
+        // Unknown type — use API's offerAmount as-is (dynamic, no hardcoded cap)
+        savings = offer.offerAmount;
         break;
     }
 

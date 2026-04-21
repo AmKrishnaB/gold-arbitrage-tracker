@@ -442,7 +442,7 @@ function parseOfferDescription(
     const pct = parseInt(pctMatch[1]);
     // Look for cap: "upto Rs. 1500" or "up to ₹1,500" or "of up to Rs. 1000"
     const capMatch = desc.match(/(?:up\s*to|upto)\s*(?:Rs\.?|₹|INR)\s*([\d,]+)/i);
-    const cap = capMatch ? parseInt(capMatch[1].replace(/,/g, '')) : null;
+    const cap = capMatch ? parseInt(capMatch[1].replace(/,/g, '')) : offerAmount;
     return { parsedType: 'percent', parsedPct: pct, parsedCap: cap };
   }
 
