@@ -234,7 +234,7 @@ function normalizeAjioProduct(raw: RawAjioProduct): NormalizedProduct | null {
   if (!shouldTrackProduct(raw.name)) return null;
 
   // Parse gold data from name
-  const parsed = parseGoldData(raw.name);
+  const parsed = parseGoldData(raw.name, 'ajio');
   if (parsed.totalWeightGrams <= 0) return null;
 
   // Price extraction

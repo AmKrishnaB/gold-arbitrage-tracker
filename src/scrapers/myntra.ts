@@ -342,7 +342,7 @@ function normalizeMyntraProduct(raw: RawMyntraProduct): NormalizedProduct | null
   if (!shouldTrackProduct(productName)) return null;
 
   // Parse gold data
-  const parsed = parseGoldData(productName);
+  const parsed = parseGoldData(productName, 'myntra');
   if (parsed.totalWeightGrams <= 0) return null;
 
   // Price extraction

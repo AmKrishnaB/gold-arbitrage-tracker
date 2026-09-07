@@ -14,10 +14,10 @@ const KARAT_TO_FINENESS: Record<number, Fineness> = {
  * Parse gold weight and purity from a product name string.
  * Handles combos, multi-piece packs, additions, and single products.
  */
-export function parseGoldData(name: string): ParsedGoldData {
+export function parseGoldData(name: string, platform: 'myntra' | 'ajio' = 'ajio'): ParsedGoldData {
   const warnings: string[] = [];
 
-  const weight = parseWeight(name, warnings);
+  const weight = parseWeight(name, warnings, platform);
   const purity = parsePurity(name, warnings);
 
   const isCombo = weight.pieceCount > 1;
@@ -44,7 +44,7 @@ interface WeightResult {
   source: WeightSource;
 }
 
-function parseWeight(name: string, warnings: string[]): WeightResult {
+function parseWeight(name: string, warnings: string[], platform: 'myntra' | 'ajio'): WeightResult {
   // Normalize the string for easier matching
   const n = name.replace(/\s+/g, ' ').trim();
 
@@ -53,15 +53,15 @@ function parseWeight(name: string, warnings: string[]): WeightResult {
   if (explicitTotal) return explicitTotal;
 
   // 2. BRACKET MULTIPLICATION: "(1gm each x 5 Pcs)" or "(2gm each x 2 Pcs)"
-  const bracketMul = tryBracketMultiplication(n);
+  const bracketMul = tryBracketMultiplication(n, platform);
   if (bracketMul) return bracketMul;
 
   // 3. N-PIECES: "6Pcs 24KT Gold Coin - 2 g Each" or "2Pcs...1 g Each"
-  const nPieces = tryNPieces(n);
+  const nPieces = tryNPieces(n, platform);
   if (nPieces) return nPieces;
 
   // 4. PACK/SET: "Pack Of 3...5gm each" or "Set of 2...Gold Bar"
-  const packSet = tryPackSet(n);
+  const packSet = tryPackSet(n, platform);
   if (packSet) return packSet;
 
   // 5. ADDITION: "2 GM + 2 GM" or "0.5 Gm + 2 Gm + 2 Gm"
@@ -94,7 +94,7 @@ function tryExplicitTotal(n: string): WeightResult | null {
 }
 
 /** "(1gm each x 5 Pcs)" → 1 × 5 = 5 */
-function tryBracketMultiplication(n: string): WeightResult | null {
+function tryBracketMultiplication(n: string, platform: 'myntra' | 'ajio'): WeightResult | null {
   const m = n.match(
     /\((\d+(?:\.\d+)?)\s*(?:g|gm|gms|gram|grams)\s*(?:each)?\s*x\s*(\d+)\s*Pcs?\)/i,
   );
@@ -102,11 +102,12 @@ function tryBracketMultiplication(n: string): WeightResult | null {
 
   const perPiece = parseFloat(m[1]);
   const count = parseInt(m[2]);
-  return { grams: perPiece * count, pieceCount: count, source: 'bracket_multiplication' };
+  const totalGrams = platform === 'myntra' ? perPiece : perPiece * count;
+  return { grams: totalGrams, pieceCount: count, source: 'bracket_multiplication' };
 }
 
 /** "6Pcs 24KT Gold Coin - 2 g Each" → 6 × 2 = 12 */
-function tryNPieces(n: string): WeightResult | null {
+function tryNPieces(n: string, platform: 'myntra' | 'ajio'): WeightResult | null {
   // Pattern: N-Pcs/NPcs at start or in string, then weight + "Each" later
   const m = n.match(
     /(\d+)\s*[-]?\s*Pcs?\b.*?(\d+(?:\.\d+)?)\s*(?:g|gm|gms|gram|grams)\s*(?:Each)?\b/i,
@@ -122,11 +123,12 @@ function tryNPieces(n: string): WeightResult | null {
   // Sanity: if count is 1, it's not really a multi-piece
   if (count <= 1) return null;
 
-  return { grams: perPiece * count, pieceCount: count, source: 'n_pieces' };
+  const totalGrams = platform === 'myntra' ? perPiece : perPiece * count;
+  return { grams: totalGrams, pieceCount: count, source: 'n_pieces' };
 }
 
 /** "Pack Of 3...5gm each" → 3 × 5 = 15, or "Set of 2 Gold Bar" */
-function tryPackSet(n: string): WeightResult | null {
+function tryPackSet(n: string, platform: 'myntra' | 'ajio'): WeightResult | null {
   const m = n.match(
     /(?:Pack\s*Of|Set\s*of)\s*(\d+)\b.*?(\d+(?:\.\d+)?)\s*(?:g|gm|gms|gram|grams)\b/i,
   );
@@ -134,6 +136,10 @@ function tryPackSet(n: string): WeightResult | null {
 
   const count = parseInt(m[1]);
   const weight = parseFloat(m[2]);
+
+  if (platform === 'myntra') {
+    return { grams: weight, pieceCount: count, source: 'pack_set' };
+  }
 
   // If "each" is present, it's per-piece; otherwise it might be total
   if (/each/i.test(n)) {
